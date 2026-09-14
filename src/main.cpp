@@ -647,7 +647,7 @@ static void runDiag(void) {
 #include "replay_frame.h"
 
 // OE low window measured from the capture: mean 190.4 samples at 24MHz = 7.93us.
-#define REPLAY_OE_US 8
+#define REPLAY_OE_US 1
 
 static inline uint8_t replayBit(const uint8_t *buf, uint32_t i) {
   return (buf[i >> 3] >> (i & 7)) & 1;   // LSB-first, matching the generator
