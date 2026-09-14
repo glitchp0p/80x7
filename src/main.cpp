@@ -15,6 +15,44 @@
 #include "hardware/pio.h"
 #include "hardware/clocks.h"
 
+// ============================================================================
+//  MODE SELECT — set MODE to exactly one value. Nothing else to change.
+// ============================================================================
+//   MODE_RUN     normal panel driver
+//   MODE_PINMAP  static DMM pin verification (LED magenta)
+//   MODE_DIAG    display-driven signal identification (LED amber)
+//   MODE_REPLAY  clock out a frame captured from the original controller (blue)
+//
+// This replaced four independent flags that each had their own default. Setting
+// one without clearing the others silently ran the wrong test more than once.
+// Now there is a single knob, and the build FAILS if it is inconsistent.
+
+#define MODE_RUN     0
+#define MODE_PINMAP  1
+#define MODE_DIAG    2
+#define MODE_REPLAY  3
+
+// >>>>>>>>>>>>>>>>  SET THIS  <<<<<<<<<<<<<<<<
+#define MODE MODE_REPLAY
+
+// Which DIAG test, when MODE == MODE_DIAG. 1=chain length 2=which line carries
+// data 3=what IDC 9 does 4=row addressing
+#define DIAG_TEST 1
+
+#if (MODE != MODE_RUN) && (MODE != MODE_PINMAP) && (MODE != MODE_DIAG) && (MODE != MODE_REPLAY)
+  #error "MODE must be one of MODE_RUN / MODE_PINMAP / MODE_DIAG / MODE_REPLAY"
+#endif
+
+// Derived flags - do not set these by hand.
+#define PIN_MAP_TEST  (MODE == MODE_PINMAP)
+#define REPLAY_MODE   (MODE == MODE_REPLAY)
+#if MODE == MODE_DIAG
+  #define DIAG_MODE DIAG_TEST
+#else
+  #define DIAG_MODE 0
+#endif
+
+
 // ---- WS2812 heartbeat (RP2040-Zero onboard LED, GP16) ----
 // TEMPORARY BRING-UP AID. The Zero has no plain GPIO LED, so without this there is
 // no visible confirmation that a flash actually took and the firmware is running.
@@ -204,7 +242,6 @@ static inline void pulseRCLK() {
 //
 // OE is deliberately included in the walk. It is active-LOW, so asserting it HIGH is the
 // blanked/safe state — this test never lights the panel.
-#define PIN_MAP_TEST 0
 #define PIN_MAP_DWELL_MS 3000
 
 // WARNING (2026-09-10): OE APPEARS NOT TO WORK ON THIS PANEL.
@@ -386,10 +423,9 @@ static void blankChain() {
 //   2 = which line carries data
 //   3 = what IDC 9 actually does
 //   4 = row addressing
-#define DIAG_MODE 0
 
 // Seconds per step. Long enough to read and note; short enough to limit heating.
-#define DIAG_STEP_MS 250
+#define DIAG_STEP_MS 1000
 
 // THERMAL WARNING: these tests are STATIC. Whatever is lit is lit at 100% duty,
 // with no multiplexing, because that is what makes them readable. Keep runs under
@@ -585,6 +621,57 @@ static void runDiag(void) {
 }
 #endif  // DIAG_MODE
 
+
+// ============================================================================
+//  REPLAY_MODE — clock out a frame recorded from the ORIGINAL controller
+// ============================================================================
+// Set to 1 to replay one captured frame verbatim, in a loop.
+//
+// WHY: every test so far has fed the panel frames built from OUR model of the
+// protocol — bit order, polarity, chain length, address mapping. When the result
+// is nonsense, there is no way to tell whether the model is wrong or the signal
+// path is. This replaces the model entirely with raw recorded line levels from
+// the LPC1768 driving this exact panel correctly.
+//
+// The result is interpretable either way:
+//   PANEL SHOWS SOMETHING COHERENT -> hardware and signal path are fine; every
+//       remaining fault is in how the firmware CONSTRUCTS frames. Narrow target.
+//   PANEL SHOWS NONSENSE -> the fault is upstream of frame content. Stop
+//       theorising about protocol; something in the signal path differs from the
+//       original in a way none of the reasoning has caught.
+//
+// Note what is deliberately ABSENT here: no RED_ON/GREEN_OFF macros, no
+// TOTAL_COLS, no bit-order assumption, no polarity flag. Only recorded levels.
+
+#if REPLAY_MODE
+#include "replay_frame.h"
+
+// OE low window measured from the capture: mean 190.4 samples at 24MHz = 7.93us.
+#define REPLAY_OE_US 8
+
+static inline uint8_t replayBit(const uint8_t *buf, uint32_t i) {
+  return (buf[i >> 3] >> (i & 7)) & 1;   // LSB-first, matching the generator
+}
+
+static void replayFrame(void) {
+  uint32_t bit = 0;
+  for (uint8_t l = 0; l < REPLAY_LOADS; l++) {
+    setRowAddress(replayAddr[l]);
+    for (uint16_t i = 0; i < replayLen[l]; i++, bit++) {
+      digitalWrite(PIN_R, replayBit(replayRed,   bit));
+      digitalWrite(PIN_G, replayBit(replayGreen, bit));
+      delayMicroseconds(1);
+      pulseSRCLK();
+    }
+    pulseRCLK();
+    // One OE low window per load, as captured (OE toggles 1:1 with RCLK).
+    digitalWrite(PIN_OE, LOW);
+    delayMicroseconds(REPLAY_OE_US);
+    digitalWrite(PIN_OE, HIGH);
+  }
+}
+#endif
+
 void setup() {
   // ---- Panel safety first: configure pins and blank the chain BEFORE anything slow. ----
   // The Serial wait below can block for 3 seconds. Previously it ran first, leaving the
@@ -627,11 +714,22 @@ void setup() {
   ws2812_put(0, 0, 24);
 
   Serial.println("=== panel driver starting ===");
-#if PIN_MAP_TEST
-  Serial.println("BUILD: PIN_MAP_TEST - static DMM pin verification, panel not driven");
-#else
-  Serial.println("BUILD: normal panel drive");
+  // Loud, unambiguous statement of which mode is actually compiled in. Read this
+  // line before interpreting ANY panel behaviour - several observations were
+  // misread because the running mode was not what was assumed.
+  Serial.println();
+  Serial.println("########################################");
+#if   MODE == MODE_RUN
+  Serial.println("#  MODE: RUN - normal panel driver");
+#elif MODE == MODE_PINMAP
+  Serial.println("#  MODE: PINMAP - static DMM check, panel not driven");
+#elif MODE == MODE_DIAG
+  Serial.print  ("#  MODE: DIAG - test "); Serial.println(DIAG_TEST);
+#elif MODE == MODE_REPLAY
+  Serial.println("#  MODE: REPLAY - captured original frame");
 #endif
+  Serial.println("########################################");
+  Serial.println();
   Serial.print("SRCLK="); Serial.print(PIN_SRCLK);
   Serial.print(" RCLK=");  Serial.print(PIN_RCLK);
   Serial.print(" OE=");    Serial.print(PIN_OE);
@@ -653,6 +751,21 @@ void setup() {
 #define WALK_STEP_MS 600
 
 void loop() {
+#if REPLAY_MODE
+  replayFrame();
+  {
+    static uint32_t n = 0, last = 0;
+    n++;
+    if (millis() - last >= 1000) {
+      last = millis();
+      ws2812_put(0, 0, 24);              // blue = replay mode
+      if (Serial) { Serial.print("replay frames/s: "); Serial.println(n); }
+      n = 0;
+    }
+  }
+  return;
+#endif
+
 #if DIAG_MODE
   runDiag();
   return;   // never calls refreshFrame(); these tests drive the panel themselves
