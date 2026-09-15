@@ -33,7 +33,7 @@
 #define MODE_REPLAY  3
 
 // >>>>>>>>>>>>>>>>  SET THIS  <<<<<<<<<<<<<<<<
-#define MODE MODE_REPLAY
+#define MODE MODE_RUN
 
 // Which DIAG test, when MODE == MODE_DIAG. 1=chain length 2=which line carries
 // data 3=what IDC 9 does 4=row addressing
@@ -306,26 +306,150 @@ static void shiftOutRow(const uint8_t *redRow, const uint8_t *greenRow) {
 static uint8_t blankPadRed[TOTAL_COLS];
 static uint8_t blankPadGreen[TOTAL_COLS];
 
+// Drives one full frame, mirroring the structure proven correct by REPLAY_MODE.
+//
+// STRUCTURE CONFIRMED FROM THE CAPTURE (not assumed):
+//   - 16 loads per frame, addresses counting DOWN 7,7,6,6,...,1,1,0,0
+//   - each address gets TWO loads = two independent bit-planes
+//   - the SECOND load at address 0 is 160 bits, not 80 (one full-chain flush)
+//   - total 15*80 + 160 = 1360 bits
+//   - one OE low window per load, ~8us, immediately after each latch
+//
+// The two planes are genuinely different data: in the capture, consecutive loads
+// at the same address had IDENTICAL red content but DIFFERENT green content. That
+// is the original's 2-level brightness scheme, not duplicated frames. The previous
+// implementation shifted the same buffer twice, which threw that away.
+//
+// FIXED HERE (was Known-bugs #1 and #2): the row address and the OE window are now
+// set PER PLANE, inside the plane loop. Previously both planes were shifted and
+// latched before the address and OE were touched even once, so plane 0's latch was
+// overwritten by plane 1's while still blanked - plane 0 never reached the LEDs,
+// and the frame emitted 8 OE windows instead of the captured 16.
+//
+// CAVEAT, measured: on this panel OE does NOT appear to gate illumination. Changing
+// the window from 8us to 1us produced no current change (2.666A -> 2.723A), while
+// 245 pin 14 reads 4.74V against a 4.93V rail, i.e. it IS pulsing correctly. The OE
+// sequencing below is kept because it matches the original hardware exactly, not
+// because it has been shown to do anything here.
+// ---- SKIP_ADDR — never select this address ----
+// Diagnostic for the bottom row, which stays lit after its slot ends and shows a
+// left-to-right brightness gradient during other rows' slots.
+//
+// That gradient is the tell: if a row is on while the chain is being shifted for
+// OTHER rows, it displays the register contents LIVE. Positions near the far end
+// of the chain reach their final value early and hold; positions near the input
+// keep changing until the last clock. Time-averaged that is bright at the far end
+// fading to dim at the input end - exactly what is seen, and the same mechanism
+// that produced the unexplained gradient in DIAG test 1.
+//
+// So the bottom row is smearing every other row's data. Dim red rather than amber
+// because it is an average of transients, not a settled value.
+//
+// THE TEST: never select the suspect address at all.
+//   Row still lights -> its high-side MOSFET is stuck on. Hardware fault: either
+//        the APM4953 for that row is damaged (gate-source short) or its gate
+//        pull-up in the HR networks is open, leaving the gate floating low.
+//        Repairable - APM4953 is a cheap SOT23-6 dual P-channel.
+//   Row goes dark    -> it IS being selected, and the fault is in addressing.
+//
+// Set to -1 to disable skipping. Try 0 and 1 in turn: which one lights the bottom
+// row also settles open question #2, since address 0 is the long-suspected
+// non-physical blanking cycle and a real row lighting there would disprove it.
+#define SLOW_SCAN_MAX_MS     30   // hard ceiling on per-address dwell
+#define SLOW_SCAN_TIMEOUT_S  20   // auto-blank after this many seconds of scanning
+
+#if SLOW_SCAN_MS > SLOW_SCAN_MAX_MS
+  #undef  SLOW_SCAN_MS
+  #define SLOW_SCAN_MS SLOW_SCAN_MAX_MS
+#endif
+
+#define SKIP_ADDR -1
+
+// ---- SLOW_SCAN_MS — make the multiplexing visible ----
+// Normally the frame cycles through all 8 addresses in a few milliseconds, so
+// persistence of vision blends them and the panel LOOKS continuously lit. That is
+// why "whole panel amber" has been so hard to interpret: it is what correct
+// multiplexing of all-pixels-on looks like, and it is also what several failure
+// modes look like.
+//
+// Set SLOW_SCAN_MS to hold each address for that many milliseconds. At 250ms the
+// rows step visibly one at a time and you can read off directly:
+//   - which PHYSICAL row each address value lights
+//   - whether address 0 lights anything at all (open question #2)
+//   - whether all seven rows are actually being driven
+//   - what content each row really holds, unblended
+//
+// 0 = normal full-speed operation.
+//
+// SAFETY - ENFORCED IN CODE, NOT BY THE OPERATOR:
+// A single row carries ~4.7A when selected. The panel is designed for 1-in-8 duty,
+// so holding one row on is ~8x its rated dissipation and destroys the APM4953 row
+// MOSFETs in SECONDS. This already happened: a static single-address hold killed
+// H1/H2 (cracked packages, burnt legs) on this board.
+//
+// Therefore:
+//   - SLOW_SCAN_MS is CAPPED at SLOW_SCAN_MAX_MS below. Larger values are clamped.
+//   - Any slow-scan run auto-stops after SLOW_SCAN_TIMEOUT_S and blanks the panel.
+//   - There is deliberately NO mode that holds a single address indefinitely.
+// Never add one. If a static measurement is needed, use a brief periodic hold, not
+// a sustained one - no test should be able to damage hardware through inattention.
+#define SLOW_SCAN_MS 0
+
+static void blankChain(void);
+
 static void refreshFrame() {
   for (int8_t addr = NUM_ADDR_STATES - 1; addr >= 0; addr--) {
-    setOE(false); // blank while shifting + latching, matches captured OE-high-during-load
-
+#if SKIP_ADDR >= 0
+    if (addr == SKIP_ADDR) {
+      // Announce the skip explicitly. Absence of a line is easy to misread as a
+      // stale build or old scrollback, and the validity of the whole test rests
+      // on this address genuinely never being selected.
+      if (Serial) { Serial.print("SKIPPING address "); Serial.println(addr); }
+      continue;                        // never selected, never shifted, never latched
+    }
+#endif
     uint8_t rowIndex = (addr >= 1 && addr <= NUM_ROWS) ? (addr - 1) : 0;
 
     for (uint8_t plane = 0; plane < BITPLANES_PER_ROW; plane++) {
-      // TODO: both planes currently shift the SAME data. Once the brightness/BCM meaning
-      // of the 2 planes is confirmed (README open question #5), differentiate them here —
-      // e.g. plane 0 = "on at all" mask, plane 1 = "bright" mask, or similar weighting.
-      shiftOutRow(redBuf[rowIndex], greenBuf[rowIndex]);
-      if (addr == 0 && plane == 1) {
-        shiftOutRow(blankPadRed, blankPadGreen); // extra 80 bits, matching captured 160-bit load
-      }
-      pulseRCLK();
-    }
+      setOE(false);                 // blank while shifting and latching
+      setRowAddress((uint8_t)addr); // address set PER PLANE, before its own window
 
-    setRowAddress((uint8_t)addr);
-    setOE(true);
-    delayMicroseconds(ROW_ON_TIME_US);
+      // TODO: plane 0 and plane 1 currently shift the same buffer. The capture
+      // shows they should differ (green content differed between the two loads at
+      // each address). Implementing real 2-level weighting needs a second buffer
+      // per colour; the structure below is ready for it.
+      if (addr == 0 && plane == 1) {
+        // The one 160-bit load per frame. Blank padding first, then the real row,
+        // so nothing stale survives anywhere in the chain.
+        shiftOutRow(blankPadRed, blankPadGreen);
+      }
+      shiftOutRow(redBuf[rowIndex], greenBuf[rowIndex]);
+      pulseRCLK();
+
+      setOE(true);
+#if SLOW_SCAN_MS > 0
+      // Auto-stop: blank and stay blanked once the timeout expires. Enforced here
+      // rather than left to the operator watching a clock.
+      if (millis() > (uint32_t)SLOW_SCAN_TIMEOUT_S * 1000UL) {
+        setOE(false);
+        memset(redBuf,   RED_OFF,   sizeof(redBuf));
+        memset(greenBuf, GREEN_OFF, sizeof(greenBuf));
+        blankChain();
+        if (Serial) Serial.println("SLOW SCAN TIMEOUT - panel blanked. Power-cycle to rerun.");
+        while (1) { ws2812_put(24, 0, 0); delay(500); ws2812_put(0,0,0); delay(500); }
+      }
+      // Hold this address long enough to see it. Serial names the address so the
+      // physical row it lights can be written down against it.
+      if (Serial && plane == 0) {
+        Serial.print("SLOW SCAN  address "); Serial.print(addr);
+        Serial.println("   <- note which PHYSICAL row lights");
+      }
+      delay(SLOW_SCAN_MS);
+#else
+      delayMicroseconds(ROW_ON_TIME_US);
+#endif
+      setOE(false);
+    }
   }
 }
 
@@ -389,7 +513,7 @@ static void runPinMapTest() {
 // warning above), the ONLY way to clear that is to shift real OFF data in. Doing it
 // first thing in setup(), before the Serial wait, keeps the uncontrolled window to
 // milliseconds instead of 3+ seconds.
-static void blankChain() {
+static void blankChain(void) {
   for (int8_t addr = NUM_ADDR_STATES - 1; addr >= 0; addr--) {
     setRowAddress((uint8_t)addr);
     for (uint8_t plane = 0; plane < BITPLANES_PER_ROW; plane++) {
@@ -647,7 +771,34 @@ static void runDiag(void) {
 #include "replay_frame.h"
 
 // OE low window measured from the capture: mean 190.4 samples at 24MHz = 7.93us.
-#define REPLAY_OE_US 1
+#define REPLAY_OE_US 8
+
+// ---- BRIGHTNESS via ROW DWELL, not OE ----
+// Measured: changing REPLAY_OE_US from 8 to 1 did NOT reduce current (2.666A ->
+// 2.723A). Meanwhile 245 pin 14 reads 4.74V against a 4.93V rail, i.e. OE IS
+// pulsing at ~4% low duty. Both facts together: OE toggles correctly on the wire
+// but does not gate illumination on this panel. IDC 9 is evidently not wired to
+// the 595 output enables.
+//
+// So the available brightness control is how long each ROW ADDRESS is held. One
+// row is selected at a time by the on-board '138; the LEDs in that row are on for
+// the whole slot. Shorten the slot and average current should fall proportionally.
+//
+// REPLAY_ROW_DWELL_US inserts a deliberate ON period per load, then parks the
+// address on a value that lights nothing. Set to 0 for no dwell limiting (the
+// previous behaviour). Start LOW and work up while watching current.
+//
+// PREDICTION TO TEST: current should scale roughly linearly with this value.
+// If it does NOT, row dwell is not the brightness control either, and the panel
+// is simply drawing what it draws.
+#define REPLAY_ROW_DWELL_US 0
+
+// Address value parked between rows. Must be one that lights no LEDs. Address 0
+// is the candidate (it receives the anomalous 160-bit load and has long been
+// suspected of being a non-physical blanking cycle) but that is UNCONFIRMED -
+// DIAG test 4 exists to settle it. If parking here still lights a row, this
+// whole mechanism does nothing.
+#define REPLAY_PARK_ADDR 0
 
 static inline uint8_t replayBit(const uint8_t *buf, uint32_t i) {
   return (buf[i >> 3] >> (i & 7)) & 1;   // LSB-first, matching the generator
@@ -668,6 +819,12 @@ static void replayFrame(void) {
     digitalWrite(PIN_OE, LOW);
     delayMicroseconds(REPLAY_OE_US);
     digitalWrite(PIN_OE, HIGH);
+#if REPLAY_ROW_DWELL_US > 0
+    // Hold this row for a bounded time, then park the address somewhere dark.
+    // This is the brightness control if OE is not one.
+    delayMicroseconds(REPLAY_ROW_DWELL_US);
+    setRowAddress(REPLAY_PARK_ADDR);
+#endif
   }
 }
 #endif
@@ -694,6 +851,17 @@ void setup() {
   memset(greenBuf, GREEN_OFF, sizeof(greenBuf));
   memset(blankPadRed,   RED_OFF,   sizeof(blankPadRed));
   memset(blankPadGreen, GREEN_OFF, sizeof(blankPadGreen));
+
+  // Four known test pixels so the display has NON-UNIFORM content. Uniform fills
+  // have never once produced a readable result on this panel; varied data has.
+  //   row 0, col 0   -> first column of module 0 (far left)
+  //   row 0, col 5   -> first column of module 1
+  //   row 3, col 40  -> mid-panel, module 8
+  //   row 3, col 41  -> its green neighbour, for a colour comparison
+  redBuf[0][0]    = RED_ON;
+  redBuf[0][5]    = RED_ON;
+  redBuf[3][40]   = RED_ON;
+  greenBuf[3][41] = GREEN_ON;
 
   blankChain();   // clear power-on garbage from the 595s immediately
 
@@ -728,6 +896,8 @@ void setup() {
 #elif MODE == MODE_REPLAY
   Serial.println("#  MODE: REPLAY - captured original frame");
 #endif
+  Serial.print  ("#  SLOW_SCAN_MS = "); Serial.println(SLOW_SCAN_MS);
+  Serial.print  ("#  SKIP_ADDR     = "); Serial.println(SKIP_ADDR);
   Serial.println("########################################");
   Serial.println();
   Serial.print("SRCLK="); Serial.print(PIN_SRCLK);

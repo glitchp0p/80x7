@@ -1,8 +1,3 @@
-
-Prior work: ~/pi_pico/andys_matrix (protocol captures in logic_probes/,
-2MHz ones superseded by 24MHz — see README open questions).
-
-
 # Hospital LED Display — Reverse Engineering Notes
 
 Salvaged 16-module bi-color (red/green) 5×7 LED dot-matrix display, originally
@@ -62,6 +57,9 @@ there is no separate third color die.
 |-----|--------|-------|
 | 1   | **SRCLK** | Shift register clock. ~1.14MHz, narrow active pulses (~1-2 samples @ 24MHz, ~42-83ns) |
 | 2   | **GND** | Confirmed via continuity test to GND pad, board unpowered |
+| 10  | **+5V** | Confirmed: reads 4.93V, identical to panel input, vs 4.95V at PSU |
+| 12  | **+5V** | As pin 10 — three conductors paralleled for current sharing |
+| 14  | **+5V** | As pin 10 |
 | 3   | **RCLK / LATCH** | Narrow active-high strobe. Fires once per row-load |
 | 6   | **R data (SER)** | Red column serial data, sampled on SRCLK rising edges |
 | 7   | **G data (SER)** | Green column serial data, sampled on SRCLK rising edges |
@@ -70,9 +68,20 @@ there is no separate third color die.
 | 13  | **A1** | Row address bit 1 |
 | 15  | **A2** | Row address bit 2 (MSB) |
 
-Pins 4, 5, 8, 10, 12, 14, 16–20 are **not yet identified** — likely GND,
-+5V, a second OE/LAT for a split panel, or spares. Not required for basic
+Pins 4, 5, 8, 16–20 are **not yet identified** — likely GND,
+a second OE/LAT for a split panel, or spares. Not required for basic
 operation but worth mapping eventually.
+
+**Emerging pattern:** signals occupy odd pins (1, 3, 9, 11, 13, 15) plus 6 and 7;
+power occupies even pins (2 = GND, 10/12/14 = +5V). Standard ribbon practice —
+supplies and grounds interleaved between signals for return paths and crosstalk
+isolation. Suggests the remaining unknowns (4, 8, 16, 18, 20) are probably
+further grounds. Quick to confirm with a meter next time the board is powered.
+
+**Measurement note:** the first DMM used read these pins at 4.5–4.8V, low enough
+to suggest a pull-up rather than a rail. A second meter read 4.93V against 4.95V
+at the PSU — a 0.02V wire drop, i.e. a direct tie. Worth remembering that meter
+disagreed; re-check anything marginal on the second one.
 
 ## Protocol / frame structure
 
@@ -250,6 +259,204 @@ Two consequences, both now fixed in source:
 **Keep the boards labelled.** An identical Zero is in service as the CMSIS-DAP
 debugprobe (GP2=SWCLK, GP3=SWDIO, GP4/5=UART). No electrical conflict — different
 board, different job — but they are physically indistinguishable.
+
+## Observation log — display states vs. driven signals
+
+Recorded live during bring-up. Each row pairs a known set of driven line values
+with the observed display. Treated as a dataset, these constrain the hardware
+more tightly than any single test — several long-held assumptions are
+contradicted by it.
+
+Notation: values are what the firmware WROTE to the R and G data lines. "R=1"
+means the red serial line was held high for every bit of the fill.
+
+| # | Mode / flags | R line | G line | Rows scanned? | Observed |
+|---|---|---|---|---|---|
+| 1 | PIN_MAP_TEST, 245 fitted | static | static | no | Bottom row only, random pattern, advancing one position per 24s cycle |
+| 2 | Normal driver, `LED_OFF`=0 | 0 | 0 | yes | **Whole panel red**, bottom row brighter + warm |
+| 3 | IDC 9 jumpered to 5V | — | — | no | Bottom row only, bright |
+| 4 | IDC 9 jumpered to GND | — | — | no | Bottom row only, bright — *identical to 5V* |
+| 5 | IDC cable fully unplugged | — | — | no | Bottom row only, bright, frozen random mix of red/green/amber/off |
+| 6 | Normal driver, `LED_OFF`=1 | 1 | 1 | yes | **Whole panel green**, bottom row brighter (less bright than red case) |
+| 7 | Per-colour: RED_OFF=1, GREEN_OFF=0 | 1 | 0 | yes | **Whole panel red**, bottom row extra bright |
+| 8 | Per-colour: RED_OFF=0, GREEN_OFF=1 | 0 | 1 | yes | **Whole panel green**, bottom row bright, warm |
+| 9 | DIAG 1 (accumulating), 200-bit fills | 1 | 0 bg | no | Bottom row red, one green added per step from LEFT, then blank |
+| 10 | DIAG 1, after wrap | 1 | 0 | no | **Fully blank**, step counter still running |
+| 11 | BOOTSEL (no firmware) | — | — | no | Bottom row, mostly-but-not-all red |
+| 12 | Normal boot, `blankChain()` in setup | 1 | 0 | yes | **Fully blank** — first reliable off state achieved |
+| 13 | DIAG 1 (stateless), 200-bit fills | 1 | 0 | no | Whole panel amber; bottom row red, gradient dark→bright left→right |
+
+### What the dataset establishes
+
+**Bits enter at the LEFT.** Row 9: the marker appeared at the left and advanced
+rightward. Resolves open question #3's direction, and supports the sequential
+module-ordering assumption.
+
+**A genuine blank state exists: R line HIGH, G line LOW** (rows 10, 12). This is
+the only blanking mechanism currently available, since OE does not respond. It
+is what `blankChain()` writes at boot.
+
+**Both data lines carry real per-pixel data** (row 9 — individual pixels changed
+one at a time, not the whole display).
+
+### What the dataset CONTRADICTS
+
+**Uniform fills cannot determine polarity.** Rows 2, 6, 7, 8 cover all four R/G
+combinations and *every one of them lit the panel* — red or green, never off. A
+test whose every outcome is "lit" carries no polarity information. Two wrong
+polarity conclusions were drawn from exactly this before the pattern was noticed.
+**Do not use uniform fills as discriminators.**
+
+**OE (IDC 9) does not blank.** Rows 3 and 4 are identical at 5V and at GND. The
+original-hardware captures show IDC 9 pulsing low once per row-load at 6.19%
+duty, which looks exactly like an output enable — but on this panel, driven from
+the RP2040, it gates nothing. Unexplained. Candidate: it drives the /OE of the
+connector-side 74HC245 bus buffers (IC1/IC2) rather than the 595 output enables,
+in which case it would gate data transfer and could never blank LEDs.
+
+**Address 0 appears to light physical rows.** The DIAG tests never call
+`setRowAddress()`, so A0–A2 sit LOW at address 0 throughout. Yet row 13 shows
+*every row lit*. The long-standing theory that address 0 is a non-physical
+blanking cycle (open question #2) does not survive this. Either address 0 selects
+a real row, or the row decoder is not gating as assumed.
+
+**The gradient in row 13 should be impossible.** The stateless version rewrites
+all 200 bits every step, so no position accumulates more display time than any
+other, and shift-register contents are binary — a smooth brightness ramp cannot
+come from data. Something other than chain contents is modulating brightness.
+
+### Open anomalies
+
+1. Why do static tests (rows 1, 3, 4, 5, 9, 11) light **only** the bottom row,
+   while scanning tests (2, 6, 7, 8) light all rows — yet row 13, which is also
+   static, lights all rows?
+2. Chain length still unmeasured. Note that 16 modules × 5 cols × 2 colours = 160
+   outputs = exactly 20 × 595, which suggests **two 80-bit chains, one per
+   colour** — i.e. `TOTAL_COLS 80` is correct and the 200-bit fills push markers
+   straight out the far end. This would explain why no marker is visible in rows
+   10 and 13.
+3. The bottom row is involved in *every single observation*. No other individual
+   row has ever appeared alone.
+
+## BREAKTHROUGH: capture replay produces correct output
+
+Replaying one frame extracted verbatim from `andy_matrix_200k_24MHz_pins1_3_6_7_9_11_13_15.csv`
+(16 loads, 1360 bits, address countdown, 160-bit load at address 0, OE 8us per
+load) rendered a **legible number — red digits on a green field**.
+
+### What this proves
+
+The entire signal path is sound: 74HCT245 level shifting, harness wiring, pin
+mapping, SRCLK, RCLK, both data lines, row addressing via A0-A2, and OE. None of
+these is the fault. **Every remaining problem is in how the firmware CONSTRUCTS
+frames**, which is a far smaller space than what was being searched.
+
+Confirmed simultaneously: the 1360-bit frame structure, the address countdown
+with two loads per value, the 160-bit load at address 0, and that OE genuinely
+does gate illumination at ~8us per load.
+
+### Corrections to earlier conclusions
+
+**"OE does nothing" was WRONG.** Observation-log rows 3 and 4 recorded identical
+results with IDC 9 at 5V and at GND. The 245's B5 output was almost certainly
+still connected and driving the pin, so the jumper was fighting it and the test
+measured nothing. OE works.
+
+**Polarity, finally.** The replayed red channel is all zeros across the entire
+frame and red digits appeared, while green carried 1052 ones out of 1360 and
+formed the background field. So: **RED is active-LOW (0 = lit), GREEN is
+active-HIGH (1 = lit).** The per-colour asymmetry was real; both earlier
+attempts had the values inverted.
+
+### New observations from the working display
+
+**Bottom row is faulty.** Red is markedly dimmer there and green does not light
+at all. The bottom row has been anomalous in *every* observation this session.
+Two possibilities, not currently distinguishable: a pre-existing hardware fault
+in that row's drivers, or damage from the sustained-DC events earlier in
+bring-up (address held static with OE enabled, no multiplexing). Worth probing
+that row's APM4953 and its 595s.
+
+**Parasitic powering through the signal lines — REAL HAZARD.** With the panel's
+5V OFF but the Pico still connected, red LEDs light dimly. This is current
+flowing through the panel ICs' ESD protection diodes from the driven inputs,
+powering the chip parasitically. It can damage those ICs over time.
+**Never drive signals into an unpowered panel.** Power the panel BEFORE the
+Pico's outputs go active, and remove power in the reverse order.
+
+Note this also explains why only red lights in that state: red LEDs have a lower
+forward voltage (~1.8-2.0V) than green (~2.1-2.6V), so a weak parasitic supply
+reaches red's threshold and not green's. It is a Vf difference, not evidence of
+overdriving.
+
+**On the overdrive hypothesis — the duty-cycle arithmetic does not support it.**
+The original ran 1360 bits at 1.14MHz = 1.19ms per frame. This bit-banged replay
+takes roughly 6ms per frame, while using the same 8us OE window per load. Per-row
+on-time is therefore about 0.26% here versus ~1.3% originally — this firmware
+drives the panel LESS hard than the original did, not more. Peak current is set
+by the panel's own series resistors and is identical either way. Red simply
+appears brighter because red LEDs are more efficient at a given current.
+
+The warmth is worth watching, but the likely cause is ordinary operation plus the
+bottom-row fault, not overdrive. Measure before assuming: compare panel current
+draw during replay against the idle/blank state.
+
+## Power characterisation — panel is thermally safe
+
+Measured with a DMM in series with the panel's 5V feed at JP1 (10A jack, DC amps).
+
+| State | Current |
+|---|---|
+| BOOTSEL, nothing driven | **0.057 A** |
+| REPLAY_MODE, ~3/4 of pixels lit | **2.67 A** (~13 W) |
+
+### Ten/twenty-minute soak
+
+2.722 A at start, 2.690 at 1.5 min, 2.682 at 3 min, 2.676 at 5 min, 2.674 at
+8 min, 2.675 at 10 min, **2.666 A at 20 min with no further temperature rise.**
+
+Current *falls* about 1.8% as the panel warms, then flattens. This is
+self-limiting, not runaway: the rising series-resistor and MOSFET on-resistance
+outweigh the LEDs' falling forward voltage. Red areas end up mildly warm, green
+stays cool.
+
+**Conclusion: 2.67 A at 5 V is this panel's normal operating point and it is
+stable indefinitely.** No need for short runs, thermal watching, or current
+limiting during testing. Judge anything anomalous against this baseline.
+
+(An earlier prediction here was that current would *climb* with temperature. It
+does not. Three successive predictions about this panel's power behaviour were
+wrong in different directions — prefer measurement over reasoning on this board.)
+
+### Brightness control: mechanism still UNKNOWN
+
+Two candidate controls were tested and neither affects current:
+
+- **OE window** — `REPLAY_OE_US` 8 -> 1 changed nothing (2.666 A -> 2.723 A),
+  despite 245 pin 14 reading 4.74 V against a 4.93 V rail, confirming it pulses
+  correctly at ~4% low duty. OE reaches the panel and does not gate illumination.
+- **Row dwell** — bounding how long each address is held, then parking on address
+  0, left current at 2.7 A unchanged.
+
+But brightness plainly *does* vary: the bottom row has appeared both brighter and
+dimmer than the rest at different times, red reads brighter than green, and DIAG
+test 1 produced a smooth left-to-right gradient. Uniform continuous illumination
+cannot produce any of that.
+
+Working hypothesis, untested: brightness tracks **how long each bit has been
+sitting latched and visible**, i.e. the display shows register contents live
+during shifting rather than only after latching. That would make frame rate and
+shift/latch sequencing the real brightness control, and would explain why the
+original ran its shift clock at 1.14 MHz — fast shifting minimises the time
+intermediate states are visible. It would also explain the gradient: bits that
+entered earlier have been visible longer within each frame.
+
+### Frame structure confirmed from capture analysis
+
+The two loads at each address carry **identical red data but DIFFERENT green
+data**. They are genuine independent bit-planes — the original's 2-level
+brightness weighting — not a duplicated frame. The previous `refreshFrame()`
+shifted the same buffer twice and discarded that distinction.
 
 ## Known firmware bugs (found by cross-checking `main.cpp` against captures)
 
