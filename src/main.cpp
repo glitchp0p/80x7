@@ -252,17 +252,43 @@ static inline void pulseRCLK() {
 // CONSEQUENCE: FORCE_OE_DISABLED PROTECTS NOTHING. Data polarity is currently the only
 // working blanking mechanism — which is why INVERT_POLARITY matters for safety, not just
 // for correct display. Keep runs short and check panel temperature by hand.
-#define FORCE_OE_DISABLED true   // SAFE DEFAULT after the pin-mapping fix:
+#define FORCE_OE_DISABLED false   // SAFE DEFAULT after the pin-mapping fix:
                                  // keep the panel blanked until the corrected mapping
                                  // has been verified on a logic analyzer.
 
+// ---- OE POLARITY: ACTIVE-HIGH on this panel ----
+// Derived from three measured states, not from the capture. Shifting is the long
+// part of every slot (~400us against an 8us window), so whatever OE state the
+// shift runs in is the state the panel spends nearly all its time in:
+//
+//   version          shift happens        PIN_OE during shift   measured
+//   pre-pipeline     interleaved          LOW  (setOE true)     4.6A,   hot
+//   pipelined        after setOE(true)    LOW                   0.143A, cool
+//   blanked-shift    after setOE(false)   HIGH                  4.5A,   warming
+//
+// Long phase at PIN_OE LOW -> 0.143A. Long phase at PIN_OE HIGH -> 4.5A.
+// Therefore HIGH enables the panel and LOW blanks it. OE is ACTIVE-HIGH here.
+//
+// The old code had this inverted, so every OE call in the driver was backwards.
+// The 0.143A version was only cool by accident - it happened to spend its long
+// phase blanked. It also explains the uniform amber: the panel was enabled ONLY
+// during the brief setOE(false) moments bracketing the latch and address change,
+// so what showed was a smear of transitions rather than settled data - which is
+// why current never tracked buffer contents.
+//
+// It also explains why changing REPLAY_OE_US did nothing: replayFrame() drives OE
+// directly with the same inverted assumption, so shortening the "window" was
+// shortening the BLANKED period, not the lit one.
+//
+// ROLLBACK: previous body was
+//     digitalWrite(PIN_OE, lit ? LOW : HIGH);
+//   with FORCE_OE_DISABLED writing HIGH.
 static inline void setOE(bool lit) {
-  // OE is active-low per capture data: LOW = panel driving/lit, HIGH = blanked.
   if (FORCE_OE_DISABLED) {
-    digitalWrite(PIN_OE, HIGH); // always blanked
+    digitalWrite(PIN_OE, LOW);  // LOW = blanked on this panel
     return;
   }
-  digitalWrite(PIN_OE, lit ? LOW : HIGH);
+  digitalWrite(PIN_OE, lit ? HIGH : LOW);
   if (lit) oeEnableCount++;
 }
 
@@ -284,7 +310,11 @@ static inline void setRowAddress(uint8_t addr) {
 // can corrupt everything shifted after it, which would explain "one bit commanded -> entire
 // row lit."
 static void shiftOutRow(const uint8_t *redRow, const uint8_t *greenRow) {
-  for (int col = TOTAL_COLS - 1; col >= 0; col--) {
+  // ASCENDING, bit 0 first - matching replayFrame(), which is the only code path
+  // that has ever rendered correctly on this hardware. This loop previously ran
+  // DESCENDING, sending every row reversed relative to the known-good reference.
+  // There was no evidence for the descending order; it was an assumption.
+  for (int col = 0; col < TOTAL_COLS; col++) {
     digitalWrite(PIN_R, redRow[col]);
     digitalWrite(PIN_G, greenRow[col]);
     delayMicroseconds(1); // setup time: let data settle before the clock samples it
@@ -331,6 +361,251 @@ static uint8_t blankPadGreen[TOTAL_COLS];
 // 245 pin 14 reads 4.74V against a 4.93V rail, i.e. it IS pulsing correctly. The OE
 // sequencing below is kept because it matches the original hardware exactly, not
 // because it has been shown to do anything here.
+// ---- POLARITY_SWEEP — test all four R/G polarity combinations automatically ----
+// The "off" values for this panel have been inferred repeatedly and repeatedly
+// been wrong. Rather than propose another model, cycle through all four
+// combinations and let the panel say which one is right.
+//
+// Every 4 seconds it rebuilds the sparse pattern under the next combination and
+// prints which one is active. ONE of the four should show a sparse diagonal of a
+// few pixels on a dark panel. The other three will light most or all of the panel.
+//
+// Report back which combination number shows the sparse pattern, and that settles
+// polarity from observation instead of inference.
+//
+// Current draw is itself a readout here: the correct combination lights ~9 pixels
+// and will draw a small fraction of what the wrong ones draw.
+#define POLARITY_SWEEP 0
+
+#if POLARITY_SWEEP
+static uint8_t sweepRedOff = 1, sweepGreenOff = 0;
+static uint8_t sweepRedOn  = 0, sweepGreenOn  = 1;
+
+static void applySweep(uint8_t combo) {
+  //  combo 0: R off=1 on=0 | G off=0 on=1
+  //  combo 1: R off=1 on=0 | G off=1 on=0
+  //  combo 2: R off=0 on=1 | G off=0 on=1
+  //  combo 3: R off=0 on=1 | G off=1 on=0
+  sweepRedOff   = (combo & 2) ? 0 : 1;  sweepRedOn   = sweepRedOff ? 0 : 1;
+  sweepGreenOff = (combo & 1) ? 1 : 0;  sweepGreenOn = sweepGreenOff ? 0 : 1;
+
+  memset(redBuf,   sweepRedOff,   sizeof(redBuf));
+  memset(greenBuf, sweepGreenOff, sizeof(greenBuf));
+  memset(blankPadRed,   sweepRedOff,   sizeof(blankPadRed));
+  memset(blankPadGreen, sweepGreenOff, sizeof(blankPadGreen));
+
+  for (uint8_t r = 0; r < NUM_ROWS; r++) {
+    uint8_t c = (uint8_t)(r * 11);
+    if (c < TOTAL_COLS) redBuf[r][c] = sweepRedOn;
+  }
+  greenBuf[3][41] = sweepGreenOn;
+
+  if (Serial) {
+    Serial.print("=== POLARITY COMBO "); Serial.print(combo);
+    Serial.print("  RED_OFF=");   Serial.print(sweepRedOff);
+    Serial.print(" GREEN_OFF=");  Serial.print(sweepGreenOff);
+    Serial.println("  <- does the panel show a SPARSE diagonal now?");
+  }
+}
+
+static void runPolaritySweep(void) {
+  static uint8_t combo = 0;
+  static uint32_t last = 0;
+  static bool started = false;
+  if (!started) { applySweep(0); started = true; last = millis(); return; }
+  if (millis() - last < 4000) return;
+  last = millis();
+  combo = (combo + 1) & 3;
+  applySweep(combo);
+}
+#endif
+
+// ---- PATTERN_SEQUENCE — systematic elimination test ----
+// Cycles through known patterns, one per PATTERN_DWELL_MS, printing the pattern
+// name and the PREDICTED current before each. Watch three things per step: panel
+// appearance, actual current, and the printed prediction. Discrepancies localise
+// the fault far better than any single test.
+//
+// Predictions assume ~10mA per lit die and 0.057A quiescent (both measured).
+// A pattern drawing far LESS than predicted means pixels are not being driven.
+// A pattern drawing far MORE means something is lit that was not commanded.
+//
+// NOTE ON "ALL AMBER": the panel currently shows amber everywhere while drawing
+// only 0.144A. 1120 lit dies would be ~11A. So that amber is NOT commanded output
+// - it is low-duty residual illumination from data shifting through rows that are
+// still enabled. Visible, but drawing almost nothing. Current is the reliable
+// readout here; the eye is not.
+#define PATTERN_SEQUENCE 1
+#define PATTERN_DWELL_MS 4000
+
+// SAFE SUBSET: run only the low-current patterns until proportionality is proven.
+// These four span 0 to 80 lit pixels and all stay under ~0.6A. If measured current
+// tracks prediction across them, current scales with lit pixel count and the
+// high-count patterns (1,2,3,6,7 - up to ~11A) become safe to run.
+//
+// Note what made the panel safe: NOT the sparse pattern itself, but the PIPELINE
+// FIX. Before it, this same sparse pattern drew 4.6A and the row drivers heated,
+// because rows stayed enabled while data shifted through them. After it, the same
+// pattern draws 0.144A and stays cool. The pattern did not change; the driver did.
+// Sparse is low-current because it lights 9 pixels - that is arithmetic, not a
+// safety property of the mode.
+//
+// Set to 0 to run the full nine-pattern sequence.
+#define PATTERN_SAFE_SUBSET 0
+
+#if PATTERN_SEQUENCE
+static void fillAll(uint8_t rv, uint8_t gv) {
+  memset(redBuf, rv, sizeof(redBuf));
+  memset(greenBuf, gv, sizeof(greenBuf));
+}
+
+// GREEN-ONLY PATTERNS.
+//
+// The red data line is stuck LOW at the panel (measured 0.7mV at IDC pin 6 while
+// the buffer held mostly 1s). RED_ON is 0, so stuck-low means red is ON for every
+// pixel - which is why the background is amber rather than dark, and why no
+// red-only pattern has ever changed the display.
+//
+// Rather than wait on that fault, drive GREEN only and read the panel as a
+// two-state display:
+//     green OFF -> pixel shows RED
+//     green ON  -> pixel shows AMBER (red + green)
+// That is enough contrast to verify addressing, bit order, module mapping and the
+// whole driver path. Red gets fixed separately; it does not block this.
+//
+// Every pattern below leaves redBuf at RED_OFF throughout, so the ONLY variable is
+// green. If the panel shows anything that does not track the green pattern, the
+// fault is in the driver, not in the red line.
+static void applyPattern(uint8_t p) {
+  const char *name = "";
+  const char *expect = "";
+  memset(redBuf, RED_OFF, sizeof(redBuf));      // constant across all patterns
+  memset(greenBuf, GREEN_OFF, sizeof(greenBuf));
+
+  switch (p) {
+    case 0:
+      name   = "ALL GREEN OFF";
+      expect = "whole panel RED (uniform)"; break;
+
+    case 1:
+      memset(greenBuf, GREEN_ON, sizeof(greenBuf));
+      name   = "ALL GREEN ON";
+      expect = "whole panel AMBER (uniform)"; break;
+
+    case 2:
+      for (uint8_t c = 0; c < TOTAL_COLS; c++) greenBuf[3][c] = GREEN_ON;
+      name   = "SINGLE ROW green (row 3)";
+      expect = "ONE amber row, six red rows -> proves row addressing"; break;
+
+    case 3:
+      for (uint8_t r = 0; r < NUM_ROWS; r++) greenBuf[r][40] = GREEN_ON;
+      name   = "SINGLE COLUMN green (col 40)";
+      expect = "ONE amber column mid-panel -> proves bit index maps to a column"; break;
+
+    case 4:
+      for (uint8_t r = 0; r < NUM_ROWS; r++)
+        for (uint8_t c = 0; c < TOTAL_COLS; c++)
+          if (((r + c) & 1) == 0) greenBuf[r][c] = GREEN_ON;
+      name   = "CHECKERBOARD green";
+      expect = "alternating amber/red per pixel -> proves PER-PIXEL control"; break;
+
+    case 5:
+      for (uint8_t r = 0; r < NUM_ROWS; r++)
+        for (uint8_t c = 0; c < TOTAL_COLS / 2; c++) greenBuf[r][c] = GREEN_ON;
+      name   = "LEFT HALF green";
+      expect = "left 8 modules AMBER, right 8 RED -> boundary shows bit ORDER"; break;
+
+    case 6:
+      for (uint8_t c = 0; c < COLS_PER_MODULE; c++) greenBuf[0][c] = GREEN_ON;
+      name   = "FIRST MODULE, ROW 0 green";
+      expect = "5 amber pixels in ONE module -> which end is bit 0?"; break;
+
+    case 7:
+      for (uint8_t r = 0; r < NUM_ROWS; r++) {
+        uint8_t c = (uint8_t)(r * 11);
+        if (c < TOTAL_COLS) greenBuf[r][c] = GREEN_ON;
+      }
+      name   = "DIAGONAL green";
+      expect = "amber diagonal stepping right and down -> row+column together"; break;
+
+    case 8:
+      for (uint8_t r = 0; r < NUM_ROWS; r++)
+        for (uint8_t c = 0; c < TOTAL_COLS; c++)
+          if ((c % 10) < 5) greenBuf[r][c] = GREEN_ON;
+      name   = "ALTERNATE MODULES green";
+      expect = "modules alternate amber/red -> proves module boundaries"; break;
+  }
+
+  if (Serial) {
+    Serial.println();
+    Serial.print("=== PATTERN "); Serial.print(p); Serial.print(": ");
+    Serial.println(name);
+    Serial.print("    expect: "); Serial.println(expect);
+  }
+}
+
+static void runPatternSequence(void) {
+  static uint8_t p = 0;
+  static uint32_t last = 0;
+  static bool started = false;
+  if (!started) { applyPattern(0); started = true; last = millis(); return; }
+  if (millis() - last < PATTERN_DWELL_MS) return;
+  last = millis();
+#if PATTERN_SAFE_SUBSET
+  // 0=all off, 5=single column, 4=single row, 8=sparse diagonal
+  static const uint8_t safeSet[] = {0, 5, 4, 8};
+  static uint8_t si = 0;
+  si = (uint8_t)((si + 1) % (sizeof(safeSet)/sizeof(safeSet[0])));
+  p = safeSet[si];
+#else
+  p = (uint8_t)((p + 1) % 9);
+#endif
+  applyPattern(p);
+}
+#endif
+
+// ---- SPARSE_TEST — minimum-current proof that the panel renders ----
+// Lights a handful of known pixels instead of a full frame. The replay frame has
+// roughly 3/4 of the panel lit and draws ~2.67A; a dozen pixels draw a tiny
+// fraction of that while proving exactly the same things: that the chain shifts,
+// that the latch works, that row addressing selects, that both colours drive, and
+// that bit index maps to the physical position expected.
+//
+// This is the correct FIRST power-up test on an undamaged panel. Use it before
+// MODE_REPLAY, not after.
+//
+// WHY PIXEL COUNT IS THE ONLY REAL CURRENT KNOB HERE:
+//   - Refresh RATE does not change current. Each row still gets one slot per
+//     frame, so the 1-in-8 duty is identical whether frames run fast or slow.
+//     Faster = shorter slots more often; slower = longer slots less often.
+//     (The earlier SLOW_SCAN damage was NOT from a slower rate: that code padded
+//     the ON time while leaving off-time alone, taking a row from a small
+//     fraction of the time to nearly all of it. Duty change, not rate change.)
+//   - Column scanning is not possible. All 80 columns in a row are driven
+//     simultaneously by the 595 outputs; the shift register holds a static state
+//     until the next latch. Multiplexing gives per-pixel CONTROL, not per-pixel
+//     TIMING. The addressable unit is the row.
+//   - OE would normally shorten on-time within a slot, but measurement shows it
+//     does not gate illumination on this hardware.
+// That leaves how many pixels are lit. It is proportional and reliable.
+#define SPARSE_TEST 0
+
+#if SPARSE_TEST
+// One pixel per row, walking diagonally, plus a colour pair for comparison.
+// Positions chosen to land in different modules so module ordering is readable.
+static void loadSparsePattern(void) {
+  memset(redBuf,   RED_OFF,   sizeof(redBuf));
+  memset(greenBuf, GREEN_OFF, sizeof(greenBuf));
+  for (uint8_t r = 0; r < NUM_ROWS; r++) {
+    uint8_t c = (uint8_t)(r * 11);          // 0,11,22,33,44,55,66 - spreads across modules
+    if (c < TOTAL_COLS) redBuf[r][c] = RED_ON;
+  }
+  // Adjacent red/green pair mid-panel, to confirm both colours and their ordering.
+  redBuf[3][40]   = RED_ON;
+  greenBuf[3][41] = GREEN_ON;
+}
+#endif
+
 // ---- SKIP_ADDR — never select this address ----
 // Diagnostic for the bottom row, which stays lit after its slot ends and shows a
 // left-to-right brightness gradient during other rows' slots.
@@ -397,59 +672,138 @@ static uint8_t blankPadGreen[TOTAL_COLS];
 
 static void blankChain(void);
 
+// ============================================================================
+//  refreshFrame() - PIPELINED. Restructured <date of this change>.
+// ============================================================================
+// ROLLBACK: the previous non-pipelined version is preserved verbatim at the
+// bottom of this comment block. If this change makes things worse, delete the
+// body below and paste that one back in. Nothing else in the file depends on
+// which version is active.
+//
+// WHY THE CHANGE - evidence, not inference:
+// Counting green '1' bits per load in the capture, by address:
+//
+//     addr | load 1 | load 2
+//       0  |   55   |   55
+//       1  |   66   |   55
+//       2  |   69   |   66
+//       3  |   51   |   69
+//       4  |   68   |   51
+//       5  |   67   |   68
+//       6  |   50   |   67
+//       7  |   80   |   50
+//
+// The SECOND load at address N carries the SAME data as the FIRST load at
+// address N+1. The counts cascade diagonally - 55, 66, 69, 51, 68, 67, 50, 80 -
+// each value appearing twice, one address apart.
+//
+// So the two loads per address are NOT bit-planes. The original controller is
+// PIPELINED: while row N is being displayed, it shifts in row N+1's data. The
+// old README theory of "2-level BCM brightness weighting" is wrong, and so was
+// the previous implementation, which shifted the SAME row twice per address.
+//
+// That is why our driver produced flat colour while the replay produced text:
+// the row-to-data pairing was lost. It also explains why green looked "stuck"
+// while red responded - the replay's red data is all zeros, so a pipeline offset
+// is invisible on red. Only green carried varying content, so only green showed
+// the symptom.
+//
+// The 160-bit load at address 0 fits too: it is pipeline priming, shifting two
+// rows' worth to fill the chain at the start of each frame.
+//
+// --- PREVIOUS VERSION, for rollback ---
+//   for (int8_t addr = NUM_ADDR_STATES - 1; addr >= 0; addr--) {
+//     const bool driveBlank = (addr == 0);
+//     uint8_t rowIndex = (addr >= 1 && addr <= NUM_ROWS) ? (addr - 1) : 0;
+//     const uint8_t *rowRed   = driveBlank ? blankPadRed   : redBuf[rowIndex];
+//     const uint8_t *rowGreen = driveBlank ? blankPadGreen : greenBuf[rowIndex];
+//     for (uint8_t plane = 0; plane < BITPLANES_PER_ROW; plane++) {
+//       setOE(false);
+//       setRowAddress((uint8_t)addr);
+//       if (addr == 0 && plane == 1) shiftOutRow(blankPadRed, blankPadGreen);
+//       shiftOutRow(rowRed, rowGreen);
+//       pulseRCLK();
+//       setOE(true);
+//       delayMicroseconds(ROW_ON_TIME_US);
+//       setOE(false);
+//     }
+//   }
+// --- END PREVIOUS VERSION ---
 static void refreshFrame() {
+  // Addresses count DOWN, as captured: 7,6,5,4,3,2,1,0.
+  // At each address we DISPLAY what was shifted during the previous slot, then
+  // shift the NEXT address's data while this one is lit.
   for (int8_t addr = NUM_ADDR_STATES - 1; addr >= 0; addr--) {
 #if SKIP_ADDR >= 0
     if (addr == SKIP_ADDR) {
-      // Announce the skip explicitly. Absence of a line is easy to misread as a
-      // stale build or old scrollback, and the validity of the whole test rests
-      // on this address genuinely never being selected.
       if (Serial) { Serial.print("SKIPPING address "); Serial.println(addr); }
-      continue;                        // never selected, never shifted, never latched
+      continue;
     }
 #endif
-    uint8_t rowIndex = (addr >= 1 && addr <= NUM_ROWS) ? (addr - 1) : 0;
 
-    for (uint8_t plane = 0; plane < BITPLANES_PER_ROW; plane++) {
-      setOE(false);                 // blank while shifting and latching
-      setRowAddress((uint8_t)addr); // address set PER PLANE, before its own window
+    // Latch whatever was shifted in during the previous iteration, select this
+    // row, and light it.
+    setOE(false);                    // blank across the latch
+    pulseRCLK();
+    setRowAddress((uint8_t)addr);
+    setOE(true);
 
-      // TODO: plane 0 and plane 1 currently shift the same buffer. The capture
-      // shows they should differ (green content differed between the two loads at
-      // each address). Implementing real 2-level weighting needs a second buffer
-      // per colour; the structure below is ready for it.
-      if (addr == 0 && plane == 1) {
-        // The one 160-bit load per frame. Blank padding first, then the real row,
-        // so nothing stale survives anywhere in the chain.
-        shiftOutRow(blankPadRed, blankPadGreen);
-      }
-      shiftOutRow(redBuf[rowIndex], greenBuf[rowIndex]);
-      pulseRCLK();
+    // The NEXT address in the countdown (wrapping 0 -> 7). Its data is what we
+    // shift while the current row is displayed.
+    int8_t nextAddr = (addr == 0) ? (NUM_ADDR_STATES - 1) : (addr - 1);
 
-      setOE(true);
+    // Address 0 is driven blank: it must not share a buffer with address 1.
+    // (Kept from the previous fix - the aliasing gave one row double on-time,
+    // which is the most likely cause of H1/H2 running hot on both panels.)
+    const bool nextBlank = (nextAddr == 0);
+    uint8_t nextRow = (nextAddr >= 1 && nextAddr <= NUM_ROWS) ? (nextAddr - 1) : 0;
+    const uint8_t *nRed   = nextBlank ? blankPadRed   : redBuf[nextRow];
+    const uint8_t *nGreen = nextBlank ? blankPadGreen : greenBuf[nextRow];
+
+    // The shift happens at the END of this block, AFTER setOE(false).
+    // See the note there.
+
 #if SLOW_SCAN_MS > 0
-      // Auto-stop: blank and stay blanked once the timeout expires. Enforced here
-      // rather than left to the operator watching a clock.
-      if (millis() > (uint32_t)SLOW_SCAN_TIMEOUT_S * 1000UL) {
-        setOE(false);
-        memset(redBuf,   RED_OFF,   sizeof(redBuf));
-        memset(greenBuf, GREEN_OFF, sizeof(greenBuf));
-        blankChain();
-        if (Serial) Serial.println("SLOW SCAN TIMEOUT - panel blanked. Power-cycle to rerun.");
-        while (1) { ws2812_put(24, 0, 0); delay(500); ws2812_put(0,0,0); delay(500); }
-      }
-      // Hold this address long enough to see it. Serial names the address so the
-      // physical row it lights can be written down against it.
-      if (Serial && plane == 0) {
-        Serial.print("SLOW SCAN  address "); Serial.print(addr);
-        Serial.println("   <- note which PHYSICAL row lights");
-      }
-      delay(SLOW_SCAN_MS);
-#else
-      delayMicroseconds(ROW_ON_TIME_US);
-#endif
+    if (millis() > (uint32_t)SLOW_SCAN_TIMEOUT_S * 1000UL) {
       setOE(false);
+      memset(redBuf,   RED_OFF,   sizeof(redBuf));
+      memset(greenBuf, GREEN_OFF, sizeof(greenBuf));
+      blankChain();
+      if (Serial) Serial.println("SLOW SCAN TIMEOUT - panel blanked. Power-cycle to rerun.");
+      while (1) { ws2812_put(24, 0, 0); delay(500); ws2812_put(0,0,0); delay(500); }
     }
+    if (Serial) {
+      Serial.print("SLOW SCAN  address "); Serial.print(addr);
+      Serial.println("   <- note which PHYSICAL row lights");
+    }
+    delay(SLOW_SCAN_MS);
+#else
+    delayMicroseconds(ROW_ON_TIME_US);
+#endif
+    // REVERTED. Shifting here (after setOE(false), i.e. "blanked") measured
+    // 4.5A with the row drivers warming. Shifting BEFORE the OE window - see
+    // above - measured 0.143A and stayed cool. The blanked-shift version is
+    // theoretically what the capture shows the original doing, but on this
+    // hardware it draws 30x more current, so the theory is wrong somewhere and
+    // the measurement wins.
+    //
+    // Known unresolved: at 0.143A the panel still shows uniform amber whose
+    // current does not vary with buffer contents, so buffer data is not reaching
+    // the display. That is a real bug - but it is a COOL bug, and diagnosing it
+    // must not be done by running the panel at 4.5A.
+    setOE(false);          // blank first: PIN_OE LOW = blanked (active-high panel)
+
+    // Shift the next row's data while BLANKED. Shifting is ~400us against an 8us
+    // lit window, so this is where the panel spends nearly all its time - and it
+    // must be spent blanked.
+    //
+    // MEASURED, to stop this being re-broken a third time:
+    //   shift while PIN_OE HIGH -> 4.5A, drivers warming   (WRONG)
+    //   shift while PIN_OE LOW  -> 0.143A, cool            (RIGHT)
+    // Both polarity and ordering must be correct TOGETHER. Inverting one without
+    // the other puts the long phase back in the enabled state and returns 4.5A by
+    // the opposite route - which is exactly what happened once already.
+    shiftOutRow(nRed, nGreen);
   }
 }
 
@@ -816,9 +1170,12 @@ static void replayFrame(void) {
     }
     pulseRCLK();
     // One OE low window per load, as captured (OE toggles 1:1 with RCLK).
-    digitalWrite(PIN_OE, LOW);
-    delayMicroseconds(REPLAY_OE_US);
+    // OE is ACTIVE-HIGH on this panel - see setOE() for the derivation.
+    // This was previously LOW-then-HIGH, i.e. inverted, which is why changing
+    // REPLAY_OE_US appeared to have no effect on current.
     digitalWrite(PIN_OE, HIGH);
+    delayMicroseconds(REPLAY_OE_US);
+    digitalWrite(PIN_OE, LOW);
 #if REPLAY_ROW_DWELL_US > 0
     // Hold this row for a bounded time, then park the address somewhere dark.
     // This is the brightness control if OE is not one.
@@ -852,16 +1209,9 @@ void setup() {
   memset(blankPadRed,   RED_OFF,   sizeof(blankPadRed));
   memset(blankPadGreen, GREEN_OFF, sizeof(blankPadGreen));
 
-  // Four known test pixels so the display has NON-UNIFORM content. Uniform fills
-  // have never once produced a readable result on this panel; varied data has.
-  //   row 0, col 0   -> first column of module 0 (far left)
-  //   row 0, col 5   -> first column of module 1
-  //   row 3, col 40  -> mid-panel, module 8
-  //   row 3, col 41  -> its green neighbour, for a colour comparison
-  redBuf[0][0]    = RED_ON;
-  redBuf[0][5]    = RED_ON;
-  redBuf[3][40]   = RED_ON;
-  greenBuf[3][41] = GREEN_ON;
+#if SPARSE_TEST
+  loadSparsePattern();
+#endif
 
   blankChain();   // clear power-on garbage from the 595s immediately
 
@@ -897,6 +1247,7 @@ void setup() {
   Serial.println("#  MODE: REPLAY - captured original frame");
 #endif
   Serial.print  ("#  SLOW_SCAN_MS = "); Serial.println(SLOW_SCAN_MS);
+  Serial.print  ("#  SPARSE_TEST   = "); Serial.println(SPARSE_TEST);
   Serial.print  ("#  SKIP_ADDR     = "); Serial.println(SKIP_ADDR);
   Serial.println("########################################");
   Serial.println();
@@ -952,6 +1303,13 @@ void loop() {
   static uint32_t lastStep = 0;
   static int walkIndex = 0;
   static bool walkingRed = true;
+
+#if POLARITY_SWEEP
+  runPolaritySweep();
+#endif
+#if PATTERN_SEQUENCE
+  runPatternSequence();
+#endif
 
   refreshFrame();
   frameCount++;
@@ -1018,6 +1376,19 @@ void loop() {
   // activity that looks like a firmware bug but is actually a blocked print call.
   if (millis() - lastReport >= 1000) {
     lastReport = millis();
+    // Reprint the build settings EVERY second, not just at boot. On USB-CDC the
+    // port does not exist until after setup() has run, so a boot-only banner is
+    // unreadable - which already caused a test result to be uninterpretable.
+    if (Serial) {
+      Serial.print("[build] SPARSE_TEST="); Serial.print(SPARSE_TEST);
+      Serial.print(" RUN_WALK_TEST=");      Serial.print(RUN_WALK_TEST);
+      Serial.print(" SLOW_SCAN_MS=");       Serial.print(SLOW_SCAN_MS);
+      Serial.print(" SKIP_ADDR=");          Serial.print(SKIP_ADDR);
+      Serial.print(" RED_OFF=");            Serial.print(RED_OFF);
+      Serial.print(" GREEN_OFF=");          Serial.print(GREEN_OFF);
+      Serial.print(" redBuf[1][0]=");       Serial.print(redBuf[1][0]);
+      Serial.print(" redBuf[0][0]=");       Serial.println(redBuf[0][0]);
+    }
     heartbeatState = !heartbeatState;
     digitalWrite(PIN_HEARTBEAT, heartbeatState);
     // Green/off blink = loop is running and refreshFrame() is returning.
