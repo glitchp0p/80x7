@@ -470,6 +470,52 @@ static void runPolaritySweep(void) {
 // show a 160-bit load (two rows' worth) at address 0, once per frame.
 #define PIPELINE_PRIME 1
 
+// ---- BRIGHTNESS ----
+// The knob is the LIT WINDOW per row, not refresh rate. Each row is lit for
+// ROW_ON_TIME_US, then blanked for the ~400us it takes to shift the next row's
+// 80 bits. Duty is therefore roughly ROW_ON_TIME_US / 400us - about 2% at 8us.
+//
+// Refresh rate does NOT change brightness: every row still gets exactly one slot
+// per frame whether frames run fast or slow, so duty is identical. Faster means
+// shorter slots more often; slower means longer slots less often.
+//
+// Current scales with duty, so doubling the window roughly doubles the draw.
+// Measured baseline: ~0.17A at 8us with green patterns.
+//
+// BRIGHTNESS_SWEEP steps through windows and prints the predicted multiplier, so
+// the relationship can be measured rather than assumed. Capped at
+// BRIGHTNESS_MAX_US - at 64us the duty is ~16%, giving roughly 1.4A, still well
+// under the 2.67A this panel type soaked for 20 minutes without heating.
+// Do NOT raise the cap without measuring; the row drivers are what fail.
+#define BRIGHTNESS_SWEEP   1
+#define BRIGHTNESS_MAX_US  64
+#define BRIGHTNESS_STEP_MS 5000
+
+#if ROW_ON_TIME_US > BRIGHTNESS_MAX_US
+  #undef  ROW_ON_TIME_US
+  #define ROW_ON_TIME_US BRIGHTNESS_MAX_US
+#endif
+
+#if BRIGHTNESS_SWEEP
+static uint16_t brightUs = 8;
+static void runBrightnessSweep(void) {
+  static uint32_t last = 0;
+  if (millis() - last < BRIGHTNESS_STEP_MS) return;
+  last = millis();
+  brightUs = (uint16_t)(brightUs * 2);
+  if (brightUs > BRIGHTNESS_MAX_US) brightUs = 8;
+  if (Serial) {
+    Serial.print(">>> ROW_ON_TIME_US = "); Serial.print(brightUs);
+    Serial.print("   duty ~");             Serial.print((brightUs * 100) / 400);
+    Serial.print("%   expect ~");          Serial.print(brightUs / 8);
+    Serial.println("x the 8us current");
+  }
+}
+#define ACTIVE_ROW_ON_US brightUs
+#else
+#define ACTIVE_ROW_ON_US ROW_ON_TIME_US
+#endif
+
 #if PATTERN_SEQUENCE
 static void fillAll(uint8_t rv, uint8_t gv) {
   memset(redBuf, rv, sizeof(redBuf));
@@ -815,7 +861,7 @@ static void refreshFrame() {
     }
     delay(SLOW_SCAN_MS);
 #else
-    delayMicroseconds(ROW_ON_TIME_US);
+    delayMicroseconds(ACTIVE_ROW_ON_US);
 #endif
     // REVERTED. Shifting here (after setOE(false), i.e. "blanked") measured
     // 4.5A with the row drivers warming. Shifting BEFORE the OE window - see
@@ -1346,6 +1392,9 @@ void loop() {
 #endif
 #if PATTERN_SEQUENCE
   runPatternSequence();
+#endif
+#if BRIGHTNESS_SWEEP
+  runBrightnessSweep();
 #endif
 
   refreshFrame();
