@@ -453,6 +453,23 @@ static void runPolaritySweep(void) {
 // Set to 0 to run the full nine-pattern sequence.
 #define PATTERN_SAFE_SUBSET 0
 
+// ---- BLANK_ADDR — which address gets no row data ----
+// 8 addresses (0-7) but only 7 physical rows, so exactly one address must be
+// driven blank. WHICH one is unsettled: skipping address 1 darkened the second
+// row from the bottom, skipping address 7 darkened the bottom row, so the '138
+// outputs are not wired to rows in numeric order.
+// Set -1 to give every address real data. Try 0-7 to find the spare.
+#define BLANK_ADDR -1
+
+// ---- PIPELINE_PRIME ----
+// Each address displays data shifted during the PREVIOUS slot. The FIRST address
+// of a frame has no predecessor inside that frame, so it shows leftovers from the
+// last frame. That row is the pipeline SEAM and is stuck regardless of its buffer
+// - matching the bottom row staying amber in every pattern, on BOTH panels, which
+// makes it structural rather than damage. The original primes it: the captures
+// show a 160-bit load (two rows' worth) at address 0, once per frame.
+#define PIPELINE_PRIME 1
+
 #if PATTERN_SEQUENCE
 static void fillAll(uint8_t rv, uint8_t gv) {
   memset(redBuf, rv, sizeof(redBuf));
@@ -730,6 +747,22 @@ static void blankChain(void);
 //   }
 // --- END PREVIOUS VERSION ---
 static void refreshFrame() {
+#if PIPELINE_PRIME
+  // Prime the seam: shift the FIRST address's data before the loop starts, so the
+  // opening latch has this frame's content rather than last frame's leftovers.
+  // Firmware equivalent of the original's 160-bit load at address 0.
+  {
+    const int8_t firstAddr = NUM_ADDR_STATES - 1;
+    uint8_t pr = (firstAddr < NUM_ROWS) ? (uint8_t)firstAddr : (uint8_t)(NUM_ROWS - 1);
+#if BLANK_ADDR >= 0
+    const bool pb = (firstAddr == BLANK_ADDR);
+#else
+    const bool pb = false;
+#endif
+    setOE(false);                       // stay blanked throughout priming
+    shiftOutRow(pb ? blankPadRed : redBuf[pr], pb ? blankPadGreen : greenBuf[pr]);
+  }
+#endif
   // Addresses count DOWN, as captured: 7,6,5,4,3,2,1,0.
   // At each address we DISPLAY what was shifted during the previous slot, then
   // shift the NEXT address's data while this one is lit.
@@ -755,8 +788,12 @@ static void refreshFrame() {
     // Address 0 is driven blank: it must not share a buffer with address 1.
     // (Kept from the previous fix - the aliasing gave one row double on-time,
     // which is the most likely cause of H1/H2 running hot on both panels.)
-    const bool nextBlank = (nextAddr == 0);
-    uint8_t nextRow = (nextAddr >= 1 && nextAddr <= NUM_ROWS) ? (nextAddr - 1) : 0;
+#if BLANK_ADDR >= 0
+    const bool nextBlank = (nextAddr == BLANK_ADDR);
+#else
+    const bool nextBlank = false;
+#endif
+    uint8_t nextRow = (nextAddr < NUM_ROWS) ? (uint8_t)nextAddr : (uint8_t)(NUM_ROWS - 1);
     const uint8_t *nRed   = nextBlank ? blankPadRed   : redBuf[nextRow];
     const uint8_t *nGreen = nextBlank ? blankPadGreen : greenBuf[nextRow];
 
