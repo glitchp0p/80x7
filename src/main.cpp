@@ -806,7 +806,9 @@ static const uint8_t font5x7[10][7] = {
 // the player applies the geometry inversions (row flip, column flip, module
 // order) so the frame data can be authored the way it looks.
 #define ANIM_MODE 1
-#define ANIM_FRAME_MS 100        // 10 fps default; lower for faster animation
+// MUST match the fps the frames were rasterised at, or motion stutters: the
+// animator's default is 20 fps, so 50ms. A mismatch drops or repeats frames.
+#define ANIM_FRAME_MS 50
 
 #if ANIM_MODE
 #include "frames.h"
@@ -849,7 +851,9 @@ static void runAnimation(void) {
   static bool started = false;
   if (!started) { renderFrame(animFrames[0]); started = true; last = millis(); return; }
   if (millis() - last < ANIM_FRAME_MS) return;
-  last = millis();
+  // Advance by the interval, not to "now", so scheduling error does not
+  // accumulate into visible jitter over a long animation.
+  last += ANIM_FRAME_MS;
   f = (uint16_t)((f + 1) % ANIM_FRAME_COUNT);
   renderFrame(animFrames[f]);
 }
