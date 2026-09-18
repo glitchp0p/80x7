@@ -677,7 +677,7 @@ static void runPatternSequence(void) {
 // COLOURS: background GREEN everywhere, digits AMBER. Amber is red+green, so the
 // green plane is ON across the whole panel and red marks only the digit pixels.
 // This uses only states confirmed working and needs no red-alone state.
-#define COUNTER_MODE 0
+#define COUNTER_MODE 1
 #define COUNTER_STEP_MS 1000
 #define COUNTER_FIRST_MODULE 6          // digits occupy modules 6,7,8,9
 #define COUNTER_GREEN_BG 0              // 0 = dark background, 1 = green background
@@ -697,39 +697,56 @@ static const uint8_t font5x7[10][7] = {
   {0x0E,0x11,0x11,0x0F,0x01,0x02,0x0C}, // 9
 };
 
+// Digits are drawn in GREEN, not red.
+//
+// WHY: all nine working patterns vary green ONLY - redBuf is uniformly RED_OFF in
+// every one of them. Amber appears wherever green is ON, which means the red die
+// is lit underneath across the whole panel regardless of what redBuf says. So the
+// controllable variable is green, and the two reachable states are:
+//     green OFF -> RED    (background)
+//     green ON  -> AMBER  (digits)
+// An earlier version drew the digits into redBuf and rendered nothing at all,
+// because redBuf has no observable effect on this panel right now.
 static void drawDigit(uint8_t digit, uint8_t module) {
   if (digit > 9 || module >= NUM_MODULES) return;
   uint16_t base = (uint16_t)module * COLS_PER_MODULE;
   for (uint8_t row = 0; row < 7 && row < NUM_ROWS; row++) {
     uint8_t bits = font5x7[digit][row];
     for (uint8_t col = 0; col < COLS_PER_MODULE; col++) {
-      // bit 4 is the leftmost of the five columns
-      if (bits & (0x10 >> col)) redBuf[row][base + col] = RED_ON;
+      // Row flipped: the panel's row 0 is physically at the BOTTOM, so glyph row 0
+      // must be written to buffer row NUM_ROWS-1. Without this the digits render
+      // upside down.
+      uint8_t bufRow = (uint8_t)(NUM_ROWS - 1 - row);
+      // Digits are AMBER = green OFF against a green-ON background (see below).
+      // Column mirrored too: bit 4 of the glyph is its leftmost column, but the
+      // panel's column 0 within a module is on the RIGHT. Reading the glyph bit
+      // with (1 << col) instead of (0x10 >> col) flips it.
+      if (bits & (1 << col)) greenBuf[bufRow][base + col] = GREEN_OFF;
     }
   }
 }
 
 static void renderCounter(uint16_t value) {
-  // Background choice matters here. Pattern 9 (red ON, green OFF) rendered as a
-  // clear amber/orange across the panel - that IS red lighting; red LEDs at low
-  // duty read orange to the eye rather than scarlet. Red added ON TOP of a green
-  // background did not read as amber, so the reliable combination is red on DARK.
-  //
-  // Set COUNTER_GREEN_BG to 1 to try green background + red digits instead.
-#if COUNTER_GREEN_BG
-  memset(redBuf,   RED_OFF,  sizeof(redBuf));
-  memset(greenBuf, GREEN_ON, sizeof(greenBuf));
-#else
-  memset(redBuf,   RED_OFF,   sizeof(redBuf));
-  memset(greenBuf, GREEN_OFF, sizeof(greenBuf));
-#endif
+  // INVERTED from the previous version. Observed on the panel:
+  //     green ON  -> the colour that was showing as the BACKGROUND (amber)
+  //     green OFF -> the colour the DIGITS were showing (green)
+  // so to get a green background with amber digits, the background is green OFF
+  // and the digit pixels are green ON... except the observed mapping is the other
+  // way round, hence: background green ON, digits green OFF.
+  memset(redBuf,   RED_OFF,  sizeof(redBuf));    // leave red alone entirely
+  memset(greenBuf, GREEN_ON, sizeof(greenBuf));  // background
 
   uint8_t d[4];
   d[0] = (uint8_t)((value / 1000) % 10);
   d[1] = (uint8_t)((value / 100)  % 10);
   d[2] = (uint8_t)((value / 10)   % 10);
   d[3] = (uint8_t)( value         % 10);
-  for (uint8_t i = 0; i < 4; i++) drawDigit(d[i], (uint8_t)(COUNTER_FIRST_MODULE + i));
+  // Module order is reversed relative to digit order: the panel's module numbering
+  // runs right-to-left as seen by the viewer, so d[0] (thousands) must go to the
+  // LAST module of the four and d[3] (units) to the first. Without this the
+  // counter reads units-first from the left.
+  for (uint8_t i = 0; i < 4; i++)
+    drawDigit(d[i], (uint8_t)(COUNTER_FIRST_MODULE + (3 - i)));
 }
 
 static void runCounter(void) {
