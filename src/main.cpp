@@ -226,7 +226,7 @@ static inline void pulseRCLK() {
 // (measured actual enabled duty was ~18.8% here vs ~6.4% on the original board).
 // Start LOW and only increase gradually while monitoring temperature and using a
 // current-limited supply — do not jump back up toward 70us.
-#define ROW_ON_TIME_US 8
+#define ROW_ON_TIME_US 64
 
 // Set to 1 to run the walking-column diagnostic, 0 to hold a completely blank frame.
 // Start with 0 — if modules 5/6/10/11 still heat with NOTHING commanded on, that's a
@@ -666,6 +666,82 @@ static void runPatternSequence(void) {
   p = (uint8_t)((p + 1) % 11);
 #endif
   applyPattern(p);
+}
+#endif
+
+// ---- COUNTER_MODE — 4-digit counter, one digit per module ----
+// Each LED module is 5 columns x 7 rows, which is exactly one 5x7 glyph. Four
+// digits occupy four adjacent modules, centred on the 16-module panel: modules
+// 6,7,8,9 -> columns 30..49.
+//
+// COLOURS: background GREEN everywhere, digits AMBER. Amber is red+green, so the
+// green plane is ON across the whole panel and red marks only the digit pixels.
+// This uses only states confirmed working and needs no red-alone state.
+#define COUNTER_MODE 0
+#define COUNTER_STEP_MS 1000
+#define COUNTER_FIRST_MODULE 6          // digits occupy modules 6,7,8,9
+#define COUNTER_GREEN_BG 0              // 0 = dark background, 1 = green background
+
+#if COUNTER_MODE
+// 5x7 digits, one byte per row, bit 4 = leftmost column.
+static const uint8_t font5x7[10][7] = {
+  {0x0E,0x11,0x13,0x15,0x19,0x11,0x0E}, // 0
+  {0x04,0x0C,0x04,0x04,0x04,0x04,0x0E}, // 1
+  {0x0E,0x11,0x01,0x02,0x04,0x08,0x1F}, // 2
+  {0x1F,0x02,0x04,0x02,0x01,0x11,0x0E}, // 3
+  {0x02,0x06,0x0A,0x12,0x1F,0x02,0x02}, // 4
+  {0x1F,0x10,0x1E,0x01,0x01,0x11,0x0E}, // 5
+  {0x06,0x08,0x10,0x1E,0x11,0x11,0x0E}, // 6
+  {0x1F,0x01,0x02,0x04,0x08,0x08,0x08}, // 7
+  {0x0E,0x11,0x11,0x0E,0x11,0x11,0x0E}, // 8
+  {0x0E,0x11,0x11,0x0F,0x01,0x02,0x0C}, // 9
+};
+
+static void drawDigit(uint8_t digit, uint8_t module) {
+  if (digit > 9 || module >= NUM_MODULES) return;
+  uint16_t base = (uint16_t)module * COLS_PER_MODULE;
+  for (uint8_t row = 0; row < 7 && row < NUM_ROWS; row++) {
+    uint8_t bits = font5x7[digit][row];
+    for (uint8_t col = 0; col < COLS_PER_MODULE; col++) {
+      // bit 4 is the leftmost of the five columns
+      if (bits & (0x10 >> col)) redBuf[row][base + col] = RED_ON;
+    }
+  }
+}
+
+static void renderCounter(uint16_t value) {
+  // Background choice matters here. Pattern 9 (red ON, green OFF) rendered as a
+  // clear amber/orange across the panel - that IS red lighting; red LEDs at low
+  // duty read orange to the eye rather than scarlet. Red added ON TOP of a green
+  // background did not read as amber, so the reliable combination is red on DARK.
+  //
+  // Set COUNTER_GREEN_BG to 1 to try green background + red digits instead.
+#if COUNTER_GREEN_BG
+  memset(redBuf,   RED_OFF,  sizeof(redBuf));
+  memset(greenBuf, GREEN_ON, sizeof(greenBuf));
+#else
+  memset(redBuf,   RED_OFF,   sizeof(redBuf));
+  memset(greenBuf, GREEN_OFF, sizeof(greenBuf));
+#endif
+
+  uint8_t d[4];
+  d[0] = (uint8_t)((value / 1000) % 10);
+  d[1] = (uint8_t)((value / 100)  % 10);
+  d[2] = (uint8_t)((value / 10)   % 10);
+  d[3] = (uint8_t)( value         % 10);
+  for (uint8_t i = 0; i < 4; i++) drawDigit(d[i], (uint8_t)(COUNTER_FIRST_MODULE + i));
+}
+
+static void runCounter(void) {
+  static uint16_t value = 0;
+  static uint32_t last = 0;
+  static bool started = false;
+  if (!started) { renderCounter(0); started = true; last = millis(); return; }
+  if (millis() - last < COUNTER_STEP_MS) return;
+  last = millis();
+  value = (uint16_t)((value + 1) % 10000);
+  renderCounter(value);
+  if (Serial) { Serial.print("counter: "); Serial.println(value); }
 }
 #endif
 
@@ -1436,7 +1512,9 @@ void loop() {
 #if POLARITY_SWEEP
   runPolaritySweep();
 #endif
-#if PATTERN_SEQUENCE
+#if COUNTER_MODE
+  runCounter();
+#elif PATTERN_SEQUENCE
   runPatternSequence();
 #endif
 #if BRIGHTNESS_SWEEP
@@ -1512,14 +1590,15 @@ void loop() {
     // port does not exist until after setup() has run, so a boot-only banner is
     // unreadable - which already caused a test result to be uninterpretable.
     if (Serial) {
-      Serial.print("[build] SPARSE_TEST="); Serial.print(SPARSE_TEST);
-      Serial.print(" RUN_WALK_TEST=");      Serial.print(RUN_WALK_TEST);
-      Serial.print(" SLOW_SCAN_MS=");       Serial.print(SLOW_SCAN_MS);
-      Serial.print(" SKIP_ADDR=");          Serial.print(SKIP_ADDR);
-      Serial.print(" RED_OFF=");            Serial.print(RED_OFF);
-      Serial.print(" GREEN_OFF=");          Serial.print(GREEN_OFF);
-      Serial.print(" redBuf[1][0]=");       Serial.print(redBuf[1][0]);
-      Serial.print(" redBuf[0][0]=");       Serial.println(redBuf[0][0]);
+      Serial.print("[build] COUNTER=");     Serial.print(COUNTER_MODE);
+      Serial.print(" GREEN_BG=");           Serial.print(COUNTER_GREEN_BG);
+      Serial.print(" ROW_ON_TIME_US=");     Serial.print(ROW_ON_TIME_US);
+      Serial.print(" RED_ON=");             Serial.print(RED_ON);
+      Serial.print(" GREEN_ON=");           Serial.print(GREEN_ON);
+      // Sample one digit pixel and one background pixel so the buffer contents
+      // can be checked against what the panel actually shows.
+      Serial.print(" redBuf[3][32]=");      Serial.print(redBuf[3][32]);
+      Serial.print(" redBuf[3][0]=");       Serial.println(redBuf[3][0]);
     }
     heartbeatState = !heartbeatState;
     digitalWrite(PIN_HEARTBEAT, heartbeatState);
