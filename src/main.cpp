@@ -385,7 +385,107 @@ static inline void advanceBcmPhase(void) {
   bcmPhase = (uint8_t)((bcmPhase + 1) % BCM_LEVELS);
 }
 
-// levelRow may be NULL, meaning every pixel in this row is full brightness.
+// ============================================================================
+//  PIO SHIFT DRIVER — replaces the bit-banged shiftOutRowL()
+// ============================================================================
+// WHY: the bit-banged shift costs ~4us per bit, capping the frame rate at ~186Hz
+// and making every BCM brightness level halve the repaint rate. PIO clocks a bit
+// out in a few cycles, so a 1360-bit frame drops from ~5ms to well under 1ms and
+// four brightness levels sit comfortably above flicker.
+//
+// NO WIRING CHANGE. The same GPIOs are driven; a PIO state machine drives them
+// instead of digitalWrite(). Latch (RCLK), OE and the address lines stay under
+// CPU control because they change once per ROW, not once per bit.
+//
+// PIN REQUIREMENT that the existing layout already satisfies: G and R data must
+// be on CONSECUTIVE GPIOs so one `out pins, 2` instruction sets both. They are:
+// PIN_G = GP6 (bit 0 of the pair), PIN_R = GP7 (bit 1). SRCLK is side-set.
+//
+// STATE MACHINE: pio0 SM1. (SM0 is the WS2812 heartbeat.)
+//
+// PROGRAM (2 instructions, wraps):
+//     out pins, 2     side 0 [D]    ; drive G,R with the next 2 bits, SRCLK low
+//     nop             side 1 [D]    ; SRCLK high  -> 595 samples on this edge
+// so one bit takes 2*(D+1) PIO cycles. With D=3 and PIO_CLKDIV below, SRCLK runs
+// at sys_clk / (clkdiv * 8). At 133MHz and clkdiv 4 that is ~4.2MHz - well above
+// the original controller's 1.14MHz but comfortably inside the 74HC595/74HCT245
+// ratings at 5V. Raise PIO_CLKDIV if the panel ever shows shifted/garbled columns.
+//
+// DATA FORMAT: 16 pixels per 32-bit word, 2 bits per pixel, pixel 0 in bits 1:0.
+// Bit 0 = green line level, bit 1 = red line level (both ACTIVE-LOW, so these are
+// the raw RED_ON/RED_OFF/GREEN_ON/GREEN_OFF values, not "lit" flags). OSR shifts
+// RIGHT so bit 0 goes out first = pixel 0 first, preserving the bit order the
+// bit-banged version established. 80 pixels = 5 words per row.
+#define PIO_DRIVER 1
+#define PIO_CLKDIV 4.0f
+
+#if PIO_DRIVER && (MODE == MODE_RUN)
+#define PANEL_PIO pio0
+#define PANEL_SM  1
+
+//   0: out pins, 2  side 0 [3]   -> 0x6602 | delay(3)<<8 | side(0)<<12
+//   1: nop          side 1 [3]   -> 0xa042 | delay(3)<<8 | side(1)<<12
+// Encoded for .side_set 1 (one side-set bit, no enable bit): delay field is
+// bits 11:8 (4 bits), side-set bit is bit 12.
+static const uint16_t panel_pio_instructions[] = {
+  (uint16_t)(0x6002 | (3u << 8) | (0u << 12)),  // out pins, 2   side 0 [3]
+  (uint16_t)(0xa042 | (3u << 8) | (1u << 12)),  // nop           side 1 [3]
+};
+static const struct pio_program panel_pio_program = {
+  .instructions = panel_pio_instructions,
+  .length = 2,
+  .origin = -1,
+};
+
+static void panelPioInit(void) {
+  uint offset = pio_add_program(PANEL_PIO, &panel_pio_program);
+
+  pio_gpio_init(PANEL_PIO, PIN_SRCLK);
+  pio_gpio_init(PANEL_PIO, PIN_G);
+  pio_gpio_init(PANEL_PIO, PIN_R);
+  pio_sm_set_consecutive_pindirs(PANEL_PIO, PANEL_SM, PIN_SRCLK, 1, true);
+  pio_sm_set_consecutive_pindirs(PANEL_PIO, PANEL_SM, PIN_G, 2, true);
+
+  pio_sm_config c = pio_get_default_sm_config();
+  sm_config_set_wrap(&c, offset + 0, offset + 1);
+  sm_config_set_sideset(&c, 1, false, false);
+  sm_config_set_sideset_pins(&c, PIN_SRCLK);
+  sm_config_set_out_pins(&c, PIN_G, 2);          // G = bit 0, R = bit 1
+  sm_config_set_out_shift(&c, true, true, 32);   // shift RIGHT, autopull at 32
+  sm_config_set_fifo_join(&c, PIO_FIFO_JOIN_TX);
+  sm_config_set_clkdiv(&c, PIO_CLKDIV);
+
+  pio_sm_init(PANEL_PIO, PANEL_SM, offset, &c);
+  pio_sm_set_enabled(PANEL_PIO, PANEL_SM, true);
+}
+
+// Block until the SM has clocked out everything it was given. The TX FIFO
+// draining is not enough - the OSR can still hold up to 32 bits - so wait for
+// the SM to stall on an empty FIFO, which only happens once the OSR is empty.
+static inline void panelPioWaitIdle(void) {
+  PANEL_PIO->fdebug = 1u << (PIO_FDEBUG_TXSTALL_LSB + PANEL_SM);   // clear flag
+  while (!(PANEL_PIO->fdebug & (1u << (PIO_FDEBUG_TXSTALL_LSB + PANEL_SM)))) { }
+}
+
+static void shiftOutRowL(const uint8_t *redRow, const uint8_t *greenRow,
+                         const uint8_t *levelRow) {
+  // Pack 80 pixels into 5 words: 2 bits per pixel, pixel 0 at bits 1:0.
+  for (int w = 0; w < TOTAL_COLS / 16; w++) {
+    uint32_t word = 0;
+    for (int i = 0; i < 16; i++) {
+      int col = w * 16 + i;
+      bool lit = (levelRow == NULL) || (levelRow[col] > bcmPhase);
+      uint32_t r = (redSuppressed()   || !lit) ? RED_OFF   : redRow[col];
+      uint32_t g = (greenSuppressed() || !lit) ? GREEN_OFF : greenRow[col];
+      word |= ((g & 1u) | ((r & 1u) << 1)) << (2 * i);
+    }
+    pio_sm_put_blocking(PANEL_PIO, PANEL_SM, word);
+  }
+  panelPioWaitIdle();   // the latch that follows must not fire mid-shift
+}
+
+#else  // ---- bit-banged fallback, unchanged ----
+
 static void shiftOutRowL(const uint8_t *redRow, const uint8_t *greenRow,
                          const uint8_t *levelRow) {
   for (int col = 0; col < TOTAL_COLS; col++) {
@@ -396,6 +496,7 @@ static void shiftOutRowL(const uint8_t *redRow, const uint8_t *greenRow,
     pulseSRCLK();
   }
 }
+#endif  // PIO_DRIVER
 
 static void shiftOutRow(const uint8_t *redRow, const uint8_t *greenRow) {
   shiftOutRowL(redRow, greenRow, NULL);
@@ -808,7 +909,7 @@ static const uint8_t font5x7[10][7] = {
 #define ANIM_MODE 1
 // MUST match the fps the frames were rasterised at, or motion stutters: the
 // animator's default is 20 fps, so 50ms. A mismatch drops or repeats frames.
-#define ANIM_FRAME_MS 50
+#define ANIM_FRAME_MS 20        // showcase is rasterised at 50 fps
 
 #if ANIM_MODE
 #include "frames.h"
@@ -1634,6 +1735,12 @@ void setup() {
   loadSparsePattern();
 #endif
 
+#if PIO_DRIVER && (MODE == MODE_RUN)
+  // PIO takes ownership of SRCLK, G and R. Only do this in the normal driver:
+  // PIN_MAP_TEST and REPLAY drive those pins with digitalWrite() and would be
+  // silently broken if the pins belonged to a state machine.
+  panelPioInit();
+#endif
   blankChain();   // clear power-on garbage from the 595s immediately
 
   Serial.begin(115200);
