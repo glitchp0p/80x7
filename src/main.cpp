@@ -128,8 +128,13 @@ static void ws2812_put(uint8_t r, uint8_t g, uint8_t b) {
 //                       IDC pin   245 A-side   signal
 #define PIN_SRCLK  4   //    1      A1 (pin 2)  shift register clock
 #define PIN_RCLK   5   //    3      A2 (pin 3)  latch
-#define PIN_R      6   //    6      A3 (pin 4)  red serial data
-#define PIN_G      7   //    7      A4 (pin 5)  green serial data
+// SWAPPED. Observed: with the background set to GREEN_ON and the digits to
+// RED_ON + GREEN_ON, the panel showed a BLACK background with GREEN digits - i.e.
+// only the pixels where redBuf was asserted lit, and they lit green. So the line
+// the firmware calls "red" is driving the green die. IDC 5 carries GREEN data and
+// IDC 7 carries RED, the opposite of the earlier assumption.
+#define PIN_G      6   //    5 (via A3/B3)  green serial data
+#define PIN_R      7   //    7 (via A4/B4)  red serial data
 #define PIN_OE     8   //    9      A5 (pin 6)  output enable (ACTIVE-HIGH, see setOE)
 #define PIN_ADDR0  9   //   11      A6 (pin 7)  row address bit 0
 #define PIN_ADDR1 10   //   13      A7 (pin 8)  row address bit 1
@@ -165,7 +170,10 @@ static void ws2812_put(uint8_t r, uint8_t g, uint8_t b) {
 //
 // Flip either flag independently if the panel disagrees.
 #define RED_ACTIVE_LOW   1
-#define GREEN_ACTIVE_LOW 0
+// BOTH lines are active-LOW. Confirmed: with PIN_R writing RED_ON (0) the digits
+// light, while GREEN_ON was writing 1 and green never appeared at all. Same die
+// behaviour on both lines, so green must match red.
+#define GREEN_ACTIVE_LOW 1
 
 #if RED_ACTIVE_LOW
   #define RED_ON  0
@@ -315,18 +323,84 @@ static inline void setRowAddress(uint8_t addr) {
 // relative to the clock edge — a single bad bit in a shift register propagates forward and
 // can corrupt everything shifted after it, which would explain "one bit commanded -> entire
 // row lit."
-static void shiftOutRow(const uint8_t *redRow, const uint8_t *greenRow) {
-  // ASCENDING, bit 0 first - matching replayFrame(), which is the only code path
-  // that has ever rendered correctly on this hardware. This loop previously ran
-  // DESCENDING, sending every row reversed relative to the known-good reference.
-  // There was no evidence for the descending order; it was an assumption.
+// ---- PER-COLOUR BRIGHTNESS via sub-frames ----
+// ROW_ON_TIME_US is global - it sets the lit window for every row and both colours
+// equally. These dim ONE colour relative to the other.
+//
+// HOW: each refresh is one of DUTY_STEPS sub-frames. A colour is written normally
+// on the first N sub-frames and forced OFF on the rest, so it runs at N/DUTY_STEPS
+// duty while the other colour is untouched.
+//
+// THIS NOW WORKS PROPERLY. An earlier version only dimmed green and produced a hue
+// shift rather than a dim, because the red line was shorted to ground and "green
+// off" showed red instead of dark. With red controllable, forcing a colour off
+// genuinely removes it.
+//
+// COST: refresh rate divides by DUTY_STEPS. At ~186 fps, 4 steps gives ~46 fps,
+// near the flicker threshold; 2 steps (~93 fps) is comfortable. Moving the driver
+// to PIO would buy this back.
+#define DUTY_STEPS  4
+#define RED_DUTY    4     // 4 = full brightness, 3, 2, 1 = progressively dimmer
+#define GREEN_DUTY  4
+
+#if (RED_DUTY < DUTY_STEPS) || (GREEN_DUTY < DUTY_STEPS)
+static uint8_t dutySubFrame = 0;
+static inline bool redSuppressed(void)   { return dutySubFrame >= RED_DUTY; }
+static inline bool greenSuppressed(void) { return dutySubFrame >= GREEN_DUTY; }
+static inline void advanceGreenSubFrame(void) {
+  dutySubFrame = (uint8_t)((dutySubFrame + 1) % DUTY_STEPS);
+}
+#else
+static inline bool redSuppressed(void)   { return false; }
+static inline bool greenSuppressed(void) { return false; }
+static inline void advanceGreenSubFrame(void) { }
+#endif
+
+// ---- PER-PIXEL BRIGHTNESS (BCM) ----
+// levelBuf holds a brightness level 0..BCM_LEVELS-1 for every pixel. Each refresh
+// is one BCM phase; a pixel is lit on phase P only if its level is greater than P.
+// Level 0 = never lit, BCM_LEVELS-1 = lit on every phase (full brightness).
+//
+// This is only possible now that a genuine DARK state exists (both lines off).
+// While red was shorted to a ground pin, every pixel always showed something, so
+// suppressing a colour swapped hue instead of dimming.
+//
+// COST: refresh rate divides by BCM_LEVELS. ~186 fps / 4 = ~46 fps, which is near
+// the flicker threshold on a panel this size. Moving the driver to PIO is the
+// proper fix; until then keep BCM_LEVELS small.
+// Blanking guard around the latch and address change. The row drivers and the
+// '138 take a finite time to settle; if OE is re-asserted too soon after the
+// address changes, a row briefly shows the PREVIOUS row's latched data. That
+// ghost reads as a wrong colour - e.g. amber on a panel where no pixel has both
+// colours set - and it only shows where adjacent rows DIFFER, which is why it
+// appeared on the digit modules and not on uniform background.
+// Raise this if ghosting persists; it costs a little brightness.
+#define GHOST_GUARD_US 3
+
+#define BCM_LEVELS 4
+static uint8_t levelBuf[NUM_ROWS][TOTAL_COLS];
+static uint8_t bcmPhase = 0;
+
+static inline void advanceBcmPhase(void) {
+  bcmPhase = (uint8_t)((bcmPhase + 1) % BCM_LEVELS);
+}
+
+// levelRow may be NULL, meaning every pixel in this row is full brightness.
+static void shiftOutRowL(const uint8_t *redRow, const uint8_t *greenRow,
+                         const uint8_t *levelRow) {
   for (int col = 0; col < TOTAL_COLS; col++) {
-    digitalWrite(PIN_R, redRow[col]);
-    digitalWrite(PIN_G, greenRow[col]);
-    delayMicroseconds(1); // setup time: let data settle before the clock samples it
+    bool lit = (levelRow == NULL) || (levelRow[col] > bcmPhase);
+    digitalWrite(PIN_R, (redSuppressed()   || !lit) ? RED_OFF   : redRow[col]);
+    digitalWrite(PIN_G, (greenSuppressed() || !lit) ? GREEN_OFF : greenRow[col]);
+    delayMicroseconds(1);
     pulseSRCLK();
   }
 }
+
+static void shiftOutRow(const uint8_t *redRow, const uint8_t *greenRow) {
+  shiftOutRowL(redRow, greenRow, NULL);
+}
+
 
 // Drives one full frame: 8 address states, 2 loads each, matching captured timing.
 // FIX (was README open question #2 / a standing TODO): the original hardware's address-0
@@ -697,57 +771,113 @@ static const uint8_t font5x7[10][7] = {
   {0x0E,0x11,0x11,0x0F,0x01,0x02,0x0C}, // 9
 };
 
-// Digits are drawn in GREEN, not red.
+// FOUR-STATE COLOUR — red data line finally works.
 //
-// WHY: all nine working patterns vary green ONLY - redBuf is uniformly RED_OFF in
-// every one of them. Amber appears wherever green is ON, which means the red die
-// is lit underneath across the whole panel regardless of what redBuf says. So the
-// controllable variable is green, and the two reachable states are:
-//     green OFF -> RED    (background)
-//     green ON  -> AMBER  (digits)
-// An earlier version drew the digits into redBuf and rendered nothing at all,
-// because redBuf has no observable effect on this panel right now.
+// Root cause of every colour oddity in this project: the red data line was wired
+// to IDC pin 6, which is a GROUND pin. The even pins 2, 4, 6, 8 are all grounds;
+// the signals live on the odd pins, and red is on IDC 5. With red shorted to
+// ground it was permanently asserted, which is why amber appeared wherever green
+// was absent, why nothing could blank, why "red alone" never rendered, and why
+// green duty produced a hue shift instead of dimming.
+//
+// The confirmed colour table:
+//     red OFF, green OFF -> DARK
+//     red ON,  green OFF -> RED
+//     red OFF, green ON  -> GREEN
+//     red ON,  green ON  -> AMBER
+//
+// Set the two colours below to anything from that table.
+#define BG_RED      RED_OFF        // background: green  (red off + green on)
+#define BG_GREEN    GREEN_ON
+#define FG_RED      RED_ON         // digits: red        (red on + green off)
+#define FG_GREEN    GREEN_OFF
+
+// Per-pixel brightness levels, 0..BCM_LEVELS-1. Digits full, background dim.
+#define BG_LEVEL    1              // green background at 1/4 brightness
+#define FG_LEVEL    (BCM_LEVELS-1) // digits at full brightness
+
+// ---- COLOUR_CYCLE — rotate the counter's colour scheme ----
+// Set to 1 to step through colour combinations every COLOUR_CYCLE_MS, printing
+// which is active. Purpose: test whether the row-3 bleed is RED-CHANNEL ONLY.
+// If the artefact appears on every scheme that uses red and on none that don't,
+// that isolates it to the red chain rather than the row driver.
+#define COLOUR_CYCLE     1
+#define COLOUR_CYCLE_MS  5000
+
+struct ColourScheme {
+  uint8_t bgR, bgG, fgR, fgG;
+  const char *name;
+};
+static const ColourScheme schemes[] = {
+  { RED_OFF, GREEN_ON,  RED_ON,  GREEN_OFF, "green bg / RED digits      (red used)"   },
+  { RED_OFF, GREEN_ON,  RED_ON,  GREEN_ON,  "green bg / AMBER digits    (red used)"   },
+  { RED_OFF, GREEN_OFF, RED_ON,  GREEN_OFF, "dark bg  / RED digits      (red used)"   },
+  { RED_ON,  GREEN_OFF, RED_OFF, GREEN_ON,  "RED bg   / green digits    (red used)"   },
+  { RED_OFF, GREEN_OFF, RED_OFF, GREEN_ON,  "dark bg  / GREEN digits    (NO red)"     },
+  { RED_OFF, GREEN_ON,  RED_OFF, GREEN_OFF, "green bg / DARK digits     (NO red)"     },
+};
+#define NUM_SCHEMES (sizeof(schemes)/sizeof(schemes[0]))
+static uint8_t schemeIdx = 0;
+
 static void drawDigit(uint8_t digit, uint8_t module) {
   if (digit > 9 || module >= NUM_MODULES) return;
   uint16_t base = (uint16_t)module * COLS_PER_MODULE;
   for (uint8_t row = 0; row < 7 && row < NUM_ROWS; row++) {
     uint8_t bits = font5x7[digit][row];
     for (uint8_t col = 0; col < COLS_PER_MODULE; col++) {
-      // Row flipped: the panel's row 0 is physically at the BOTTOM, so glyph row 0
-      // must be written to buffer row NUM_ROWS-1. Without this the digits render
-      // upside down.
+      // Panel geometry is inverted on all three axes, confirmed empirically:
+      //   row 0 is at the BOTTOM        -> NUM_ROWS-1-row
+      //   column 0 within a module is on the RIGHT -> (1 << col), not (0x10 >> col)
+      //   module numbering runs RIGHT-TO-LEFT      -> handled in renderCounter()
       uint8_t bufRow = (uint8_t)(NUM_ROWS - 1 - row);
-      // Digits are AMBER = green OFF against a green-ON background (see below).
-      // Column mirrored too: bit 4 of the glyph is its leftmost column, but the
-      // panel's column 0 within a module is on the RIGHT. Reading the glyph bit
-      // with (1 << col) instead of (0x10 >> col) flips it.
-      if (bits & (1 << col)) greenBuf[bufRow][base + col] = GREEN_OFF;
+      if (bits & (1 << col)) {
+#if COLOUR_CYCLE
+        redBuf[bufRow][base + col]   = schemes[schemeIdx].fgR;
+        greenBuf[bufRow][base + col] = schemes[schemeIdx].fgG;
+#else
+        redBuf[bufRow][base + col]   = FG_RED;
+        greenBuf[bufRow][base + col] = FG_GREEN;
+#endif
+        levelBuf[bufRow][base + col] = FG_LEVEL;
+      }
     }
   }
 }
 
 static void renderCounter(uint16_t value) {
-  // INVERTED from the previous version. Observed on the panel:
-  //     green ON  -> the colour that was showing as the BACKGROUND (amber)
-  //     green OFF -> the colour the DIGITS were showing (green)
-  // so to get a green background with amber digits, the background is green OFF
-  // and the digit pixels are green ON... except the observed mapping is the other
-  // way round, hence: background green ON, digits green OFF.
-  memset(redBuf,   RED_OFF,  sizeof(redBuf));    // leave red alone entirely
-  memset(greenBuf, GREEN_ON, sizeof(greenBuf));  // background
+#if COLOUR_CYCLE
+  const ColourScheme *sc = &schemes[schemeIdx];
+  memset(redBuf,   sc->bgR, sizeof(redBuf));
+  memset(greenBuf, sc->bgG, sizeof(greenBuf));
+#else
+  memset(redBuf,   BG_RED,   sizeof(redBuf));
+  memset(greenBuf, BG_GREEN, sizeof(greenBuf));
+#endif
+  memset(levelBuf, BG_LEVEL, sizeof(levelBuf));
 
   uint8_t d[4];
   d[0] = (uint8_t)((value / 1000) % 10);
   d[1] = (uint8_t)((value / 100)  % 10);
   d[2] = (uint8_t)((value / 10)   % 10);
   d[3] = (uint8_t)( value         % 10);
-  // Module order is reversed relative to digit order: the panel's module numbering
-  // runs right-to-left as seen by the viewer, so d[0] (thousands) must go to the
-  // LAST module of the four and d[3] (units) to the first. Without this the
-  // counter reads units-first from the left.
   for (uint8_t i = 0; i < 4; i++)
     drawDigit(d[i], (uint8_t)(COUNTER_FIRST_MODULE + (3 - i)));
 }
+
+#if COLOUR_CYCLE
+static void advanceScheme(void) {
+  static uint32_t last = 0;
+  if (millis() - last < COLOUR_CYCLE_MS) return;
+  last = millis();
+  schemeIdx = (uint8_t)((schemeIdx + 1) % NUM_SCHEMES);
+  if (Serial) {
+    Serial.println();
+    Serial.print("=== COLOUR SCHEME "); Serial.print(schemeIdx);
+    Serial.print(": "); Serial.println(schemes[schemeIdx].name);
+    Serial.println("    does the row-3 bleed appear on this one?");
+  }
+}
+#endif
 
 static void runCounter(void) {
   static uint16_t value = 0;
@@ -757,6 +887,9 @@ static void runCounter(void) {
   if (millis() - last < COUNTER_STEP_MS) return;
   last = millis();
   value = (uint16_t)((value + 1) % 10000);
+#if COLOUR_CYCLE
+  advanceScheme();
+#endif
   renderCounter(value);
   if (Serial) { Serial.print("counter: "); Serial.println(value); }
 }
@@ -941,7 +1074,8 @@ static void refreshFrame() {
     const bool pb = false;
 #endif
     setOE(false);                       // stay blanked throughout priming
-    shiftOutRow(pb ? blankPadRed : redBuf[pr], pb ? blankPadGreen : greenBuf[pr]);
+    shiftOutRowL(pb ? blankPadRed : redBuf[pr], pb ? blankPadGreen : greenBuf[pr],
+                 pb ? NULL : levelBuf[pr]);
   }
 #endif
   // Addresses count DOWN, as captured: 7,6,5,4,3,2,1,0.
@@ -958,8 +1092,10 @@ static void refreshFrame() {
     // Latch whatever was shifted in during the previous iteration, select this
     // row, and light it.
     setOE(false);                    // blank across the latch
+    delayMicroseconds(GHOST_GUARD_US);   // let the drivers actually turn off
     pulseRCLK();
     setRowAddress((uint8_t)addr);
+    delayMicroseconds(GHOST_GUARD_US);   // let the '138 and row drivers settle
     setOE(true);
 
     // The NEXT address in the countdown (wrapping 0 -> 7). Its data is what we
@@ -1021,7 +1157,7 @@ static void refreshFrame() {
     // Both polarity and ordering must be correct TOGETHER. Inverting one without
     // the other puts the long phase back in the enabled state and returns 4.5A by
     // the opposite route - which is exactly what happened once already.
-    shiftOutRow(nRed, nGreen);
+    shiftOutRowL(nRed, nGreen, nextBlank ? NULL : levelBuf[nextRow]);
   }
 }
 
@@ -1539,6 +1675,8 @@ void loop() {
 #endif
 
   refreshFrame();
+  advanceGreenSubFrame();
+  advanceBcmPhase();
   frameCount++;
 
   if (millis() - lastStep >= WALK_STEP_MS) {
