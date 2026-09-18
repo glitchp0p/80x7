@@ -1,3 +1,48 @@
+# READ THIS FIRST — current confirmed state
+
+The sections further down were written incrementally during bring-up and several
+of their conclusions were later DISPROVED by measurement. Where they conflict
+with this block, this block wins. Superseded claims are kept below because the
+wrong turns are instructive, not because they are true.
+
+## Confirmed by measurement, on a working panel
+
+- **OE (IDC 9) is ACTIVE-HIGH.** PIN_OE HIGH enables the panel; LOW blanks it.
+  Derived from three measured states: shifting is ~400us of every slot against an
+  8us lit window, so whichever OE level the shift runs in dominates. Shift with
+  PIN_OE LOW -> 0.143A and cool. Shift with PIN_OE HIGH -> 4.5A and the row
+  drivers heat. **Anything below that says "OE is active-low" is WRONG and wiring
+  to it will repeat the failure that destroyed H1/H2.**
+- **OE LOW is a genuine blanking mechanism.** Panel goes completely dark with OE
+  held low, independent of data. That is the "off" control.
+- **The driver is PIPELINED, not bit-planed.** Counting green bits per load in the
+  capture: the SECOND load at address N carries the SAME data as the FIRST load at
+  address N+1. Each address displays data shifted during the PREVIOUS slot. The
+  "2-level BCM brightness weighting" theory below is WRONG.
+- **The frame needs PIPELINE PRIMING.** The first address of a frame has no
+  predecessor within it, so without priming it shows last frame's leftovers. That
+  seam - not a hardware fault - is what made one row look permanently stuck on
+  BOTH panels.
+- **BLANK_ADDR -1 is correct**: every address gets real buffer data, addresses 0-6
+  mapping to rows 0-6. Deliberately blanking an address was wrong.
+- **Brightness = the lit window (`ROW_ON_TIME_US`), not refresh rate.** Duty is
+  roughly ROW_ON_TIME_US / shift time. Refresh rate changes nothing, because every
+  row still gets exactly one slot per frame either way. Measured: 8us -> ~0.17A,
+  64us -> ~0.7A, scaling roughly linearly, all cool.
+- **Green control works fully.** Green off shows red, green on shows amber, and
+  all nine test patterns render correctly - rows, columns, checkerboard, module
+  boundaries, diagonals.
+
+## Known outstanding
+
+- **The red data line is broken between the Zero and the 245.** GP6 reads 3.28V
+  but intermittently drops to millivolts; the 245's A3 input reads 1.6mV. A flaky
+  breadboard contact. Because RED_ON is 0, a line stuck low means red is ON for
+  every pixel - which is why the background is amber and why "red" and "off" are
+  currently unreachable. This is the reason for the soldered stripboard build.
+- Once red is controllable, all four pixel states (off / red / green / amber)
+  should follow with no further protocol work.
+
 # Hospital LED Display — Reverse Engineering Notes
 
 Salvaged 16-module bi-color (red/green) 5×7 LED dot-matrix display, originally
@@ -124,18 +169,32 @@ One package covers all 8 required signals:
 All pin numbers below are **package pin numbers on the 74HCT245** except
 where the column says otherwise.
 
-| Signal | RP2040 GPIO | firmware macro | 245 A-side (in) | 245 B-side (out) | Panel IDC |
-|--------|-------------|----------------|-----------------|------------------|-----------|
+| Signal | Zero pad | firmware macro | 245 A-side (in) | 245 B-side (out) | Panel IDC |
+|--------|----------|----------------|-----------------|------------------|-----------|
 | SRCLK  | GP4  | `PIN_SRCLK` | A1 — pin 2 | B1 — pin 18 | pin 1 |
 | RCLK   | GP5  | `PIN_RCLK`  | A2 — pin 3 | B2 — pin 17 | pin 3 |
 | R data | GP6  | `PIN_R`     | A3 — pin 4 | B3 — pin 16 | pin 6 |
 | G data | GP7  | `PIN_G`     | A4 — pin 5 | B4 — pin 15 | pin 7 |
-| OE     | GP9  | `PIN_OE`    | A5 — pin 6 | B5 — pin 14 | pin 9 |
-| A0     | GP10 | `PIN_ADDR0` | A6 — pin 7 | B6 — pin 13 | pin 11 |
-| A1     | GP11 | `PIN_ADDR1` | A7 — pin 8 | B7 — pin 12 | pin 13 |
-| A2     | GP12 | `PIN_ADDR2` | A8 — pin 9 | B8 — pin 11 | pin 15 |
+| OE     | GP8  | `PIN_OE`    | A5 — pin 6 | B5 — pin 14 | pin 9 |
+| A0     | GP9  | `PIN_ADDR0` | A6 — pin 7 | B6 — pin 13 | pin 11 |
+| A1     | GP10 | `PIN_ADDR1` | A7 — pin 8 | B7 — pin 12 | pin 13 |
+| A2     | GP11 | `PIN_ADDR2` | A8 — pin 9 | B8 — pin 11 | pin 15 |
 
-GP2, GP3 and GP8 are **not** connected to the panel.
+**REVISED for the soldered stripboard build.** GP4-GP11 now run contiguously into
+A1-A8, matching the Zero's pad spacing. OE moved GP9 -> GP8, address lines each
+shifted back one, heartbeat moved GP8 -> GP12. Wiring convenience only.
+
+Fixed pins on the 245: pin 1 (DIR) -> 5V, pin 19 (/OE) -> GND, pin 20 -> 5V,
+pin 10 -> GND, 100nF X7R across pins 20 and 10 with short leads. Ground common
+between Zero, 245 and panel. Panel IDC pin 2 = GND; pins 10, 12, 14 = +5V.
+
+**The B-side runs backwards** (B1 = pin 18 down to B8 = pin 11), so the signal
+wiring crosses over rather than running straight across the package.
+
+Socket the 245 rather than soldering it down - spare 244s and the second bank are
+available if a channel fails.
+
+
 
 GND: RP2040 GND → 245 pin 10 → panel IDC pin 2.
 
@@ -457,6 +516,92 @@ The two loads at each address carry **identical red data but DIFFERENT green
 data**. They are genuine independent bit-planes — the original's 2-level
 brightness weighting — not a duplicated frame. The previous `refreshFrame()`
 shifted the same buffer twice and discarded that distinction.
+
+## Row addressing — MEASURED, and it is not what was assumed
+
+Established by selectively skipping addresses (`SKIP_ADDR`) during a slow scan:
+
+- **Address 0 lights a real physical row.** The long-standing theory that it is a
+  non-physical blanking cycle (former open question #2) is **WRONG**. Skipping it
+  changed the bottom row's behaviour, which a dummy cycle could not do.
+- **Address 7 appears to be the spare** '138 output, not address 0.
+- **The decoder-output-to-row mapping is NOT sequential.** Skipping address 1
+  darkened the second row from the bottom; skipping address 7 darkened the bottom
+  row. Whatever order the '138 outputs are wired to the row drivers in, it is a
+  routing convenience and must be measured, never assumed.
+- This also invalidates the explanation for the anomalous 160-bit load at address
+  0 (it was assumed to be padding for a dummy cycle). **No replacement explanation
+  yet.** The load is real and reproducible in the captures; its purpose is unknown.
+
+`rowIndex` in `refreshFrame()` is therefore still wrong: it maps address N to
+`redBuf[N-1]` for 1-7 and aliases address 0 onto `redBuf[0]`. The correct mapping
+cannot be written until the full address-to-physical-row table is measured.
+
+## The brightness gradient — MECHANISM IDENTIFIED
+
+A row that is on while the chain is being shifted **for other rows** displays the
+shift register contents LIVE. Positions near the far end of the chain reach their
+final value early and hold; positions near the input keep changing until the last
+clock. Time-averaged: bright at the far end, fading to dim at the input end.
+
+That is the left-to-right gradient seen on the bottom row, and the same mechanism
+produced the unexplained gradient in DIAG test 1. It is a symptom of a row being
+stuck on, not a data problem.
+
+## HARDWARE DAMAGE — APM4953 row drivers H1 and H2
+
+**H2 smoked and was powered down immediately. Both H1 and H2 show cracked
+packages with puckering, heat discoloration, and burn marks on some of H1's legs.
+H3 and H4 appear undamaged.**
+
+### Cause
+
+A firmware mode (`HOLD_ADDR`) that held a single row address statically. **One row
+draws ~4.7A when selected.** The panel is designed for 1-in-8 multiplexed duty, so
+holding one row on is roughly 8x its rated dissipation — enough to destroy the row
+MOSFETs in SECONDS, not minutes. The mode shipped with no timeout and relied on
+the operator to stop it in time. That was an unsafe test design.
+
+Contributing history: earlier bring-up also ran sustained single-address drive for
+extended periods during the polarity investigation, and slow scans at 250ms dwell.
+Whether H1 was already damaged before today or failed the same way earlier cannot
+now be determined.
+
+### Electrical state after the failure
+
+Resistance across the panel's 5V input and GND at JP1, unpowered: **~943 ohms,
+symmetric in both probe directions.** No short across the rail — the MOSFETs did
+not fail short. Symmetric reading indicates resistive loading (pull-ups, logic
+inputs), not a conducting junction. **The panel is safe to leave on the bench.**
+
+### Repair outlook
+
+APM4953 is a commodity SOT23-6 dual P-channel, cheap and available. Desoldering
+the part itself is routine (hot air ~300C, or drag-soldering). The risk is the
+surroundings: a dense board with LED modules nearby that will not tolerate 300C.
+Kapton the neighbours and keep airflow low.
+
+**Consider whether repair is warranted at all.** Losing one row costs 1/7 of the
+display. If the damage stops at the bottom row, a working 6-row panel may be
+sufficient depending on the intended use.
+
+## Safety rules now ENFORCED IN FIRMWARE
+
+Following the H1/H2 failure, the code — not the operator — enforces these:
+
+- **`HOLD_ADDR` has been REMOVED.** There is deliberately no mode that holds a
+  single address indefinitely. **Never add one.**
+- `SLOW_SCAN_MS` is capped at `SLOW_SCAN_MAX_MS` (30ms) by the preprocessor;
+  larger values are clamped, not honoured.
+- Any slow-scan run auto-blanks after `SLOW_SCAN_TIMEOUT_S` (20s) and halts with
+  the LED flashing red. Power-cycle to rerun.
+- Default state is `SLOW_SCAN_MS 0`, `SKIP_ADDR -1` — normal multiplexed operation
+  at 2.67A, which the panel sustains indefinitely.
+
+**Principle: no test on this panel should be able to damage it through
+inattention.** If a static measurement is needed, use a brief periodic hold with a
+hard timeout, never a sustained one. Prefer a gentler way to get a number over
+making the panel work harder.
 
 ## Known firmware bugs (found by cross-checking `main.cpp` against captures)
 

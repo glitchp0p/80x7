@@ -120,19 +120,25 @@ static void ws2812_put(uint8_t r, uint8_t g, uint8_t b) {
 // floated. Do not change these without re-checking continuity to the IDC header.
 //
 //                        IDC pin   signal
-#define PIN_SRCLK  4   //    1      shift register clock
-#define PIN_RCLK   5   //    3      latch
-#define PIN_R      6   //    6      red serial data
-#define PIN_G      7   //    7      green serial data
-#define PIN_OE     9   //    9      output enable (active low)
-#define PIN_ADDR0 10   //   11      row address bit 0
-#define PIN_ADDR1 11   //   13      row address bit 1
-#define PIN_ADDR2 12   //   15      row address bit 2
-// IDC pin 2 = GND. GP2, GP3 and GP8 are NOT connected to the panel.
+// REVISED for the soldered stripboard build: GP4-GP11 now run CONTIGUOUSLY into
+// the 245's A1-A8, which lines up cleanly against the Zero's pad spacing. OE moved
+// from GP9 to GP8; the address lines each shift back one; the heartbeat moved off
+// GP8 to GP12. Purely a wiring convenience - no electrical difference.
 //
-// Heartbeat output — GP8 is free (wired to nothing) and adjacent to the panel
+//                       IDC pin   245 A-side   signal
+#define PIN_SRCLK  4   //    1      A1 (pin 2)  shift register clock
+#define PIN_RCLK   5   //    3      A2 (pin 3)  latch
+#define PIN_R      6   //    6      A3 (pin 4)  red serial data
+#define PIN_G      7   //    7      A4 (pin 5)  green serial data
+#define PIN_OE     8   //    9      A5 (pin 6)  output enable (ACTIVE-HIGH, see setOE)
+#define PIN_ADDR0  9   //   11      A6 (pin 7)  row address bit 0
+#define PIN_ADDR1 10   //   13      A7 (pin 8)  row address bit 1
+#define PIN_ADDR2 11   //   15      A8 (pin 9)  row address bit 2
+// IDC pin 2 = GND. GP2, GP3 and GP12 are NOT connected to the panel.
+//
+// Heartbeat output — GP12 is free (wired to nothing) and adjacent to the panel
 // signals, so it can share a logic-analyzer capture as a "firmware is alive" marker.
-#define PIN_HEARTBEAT 8
+#define PIN_HEARTBEAT 12
 
 // ---- Panel geometry (confirmed via capture) ----
 #define NUM_MODULES        16
@@ -487,7 +493,7 @@ static void runPolaritySweep(void) {
 // BRIGHTNESS_MAX_US - at 64us the duty is ~16%, giving roughly 1.4A, still well
 // under the 2.67A this panel type soaked for 20 minutes without heating.
 // Do NOT raise the cap without measuring; the row drivers are what fail.
-#define BRIGHTNESS_SWEEP   1
+#define BRIGHTNESS_SWEEP   0
 #define BRIGHTNESS_MAX_US  64
 #define BRIGHTNESS_STEP_MS 5000
 
@@ -539,64 +545,100 @@ static void fillAll(uint8_t rv, uint8_t gv) {
 // Every pattern below leaves redBuf at RED_OFF throughout, so the ONLY variable is
 // green. If the panel shows anything that does not track the green pattern, the
 // fault is in the driver, not in the red line.
+// FULL FOUR-STATE PATTERNS.
+//
+// Now that the soldered breakout works, red is controllable and all four pixel
+// states are reachable:
+//     red OFF (1), green OFF (0) -> BLANK
+//     red ON  (0), green OFF (0) -> RED
+//     red OFF (1), green ON  (1) -> GREEN
+//     red ON  (0), green ON  (1) -> AMBER
+//
+// Patterns 0-3 verify each state uniformly. 4-9 verify geometry. 10-12 verify
+// that all four states can coexist in one frame, which is the real test.
+// GREEN-ONLY PATTERNS — restored, because these all worked.
+//
+// The red data line is not currently functional on the soldered board (no red
+// under any pattern; it was stuck ON on the breadboard and appears stuck OFF now).
+// A previous attempt replaced these with four-state patterns built mostly from
+// red - patterns that render as nothing at all while red is unavailable, which
+// looked like a driver regression and was not one. Do not reintroduce red-based
+// patterns until red is measured working.
+//
+// USABLE STATES RIGHT NOW:
+//     green OFF -> DARK   (red is off, so this is a genuine blank)
+//     green ON  -> GREEN
+//   plus global brightness via ROW_ON_TIME_US.
+//
+// NOTE: brightness is GLOBAL, not per-pixel. ROW_ON_TIME_US sets the lit window
+// for every row equally, so it cannot be used to turn individual pixels off. Per
+// pixel off is green OFF - which now works, since red no longer lights.
 static void applyPattern(uint8_t p) {
   const char *name = "";
   const char *expect = "";
-  memset(redBuf, RED_OFF, sizeof(redBuf));      // constant across all patterns
+  memset(redBuf,   RED_OFF,   sizeof(redBuf));      // constant across all patterns
   memset(greenBuf, GREEN_OFF, sizeof(greenBuf));
 
   switch (p) {
     case 0:
-      name   = "ALL GREEN OFF";
-      expect = "whole panel RED (uniform)"; break;
+      name = "BOTH OFF"; expect = "red OFF + green OFF -> DARK, or RED if red is stuck on"; break;
+
+    case 9:
+      // RED ALONE. Amber is appearing in other patterns, so the red die IS
+      // lighting - which means red works and what has never been tested in this
+      // build is red WITHOUT green. This is that test.
+      memset(redBuf, RED_ON, sizeof(redBuf));
+      name = "RED ALONE (red ON, green OFF)";
+      expect = "uniform RED. If this is DARK, red only lights alongside green."; break;
+
+    case 10:
+      // Half red-alone, half amber: puts red and amber side by side in one frame
+      // so they can be compared directly rather than four seconds apart.
+      memset(redBuf, RED_ON, sizeof(redBuf));
+      for (uint8_t r = 0; r < NUM_ROWS; r++)
+        for (uint8_t c = TOTAL_COLS / 2; c < TOTAL_COLS; c++) greenBuf[r][c] = GREEN_ON;
+      name = "LEFT RED / RIGHT AMBER";
+      expect = "left half red, right half amber -> direct comparison"; break;
 
     case 1:
       memset(greenBuf, GREEN_ON, sizeof(greenBuf));
-      name   = "ALL GREEN ON";
-      expect = "whole panel AMBER (uniform)"; break;
+      name = "ALL GREEN"; expect = "whole panel GREEN, uniform - highest current"; break;
 
     case 2:
       for (uint8_t c = 0; c < TOTAL_COLS; c++) greenBuf[3][c] = GREEN_ON;
-      name   = "SINGLE ROW green (row 3)";
-      expect = "ONE amber row, six red rows -> proves row addressing"; break;
+      name = "SINGLE ROW (row 3)"; expect = "ONE green row -> proves row addressing"; break;
 
     case 3:
       for (uint8_t r = 0; r < NUM_ROWS; r++) greenBuf[r][40] = GREEN_ON;
-      name   = "SINGLE COLUMN green (col 40)";
-      expect = "ONE amber column mid-panel -> proves bit index maps to a column"; break;
+      name = "SINGLE COLUMN (col 40)"; expect = "ONE green column mid-panel"; break;
 
     case 4:
       for (uint8_t r = 0; r < NUM_ROWS; r++)
         for (uint8_t c = 0; c < TOTAL_COLS; c++)
           if (((r + c) & 1) == 0) greenBuf[r][c] = GREEN_ON;
-      name   = "CHECKERBOARD green";
-      expect = "alternating amber/red per pixel -> proves PER-PIXEL control"; break;
+      name = "CHECKERBOARD"; expect = "alternating green/dark -> PER-PIXEL control"; break;
 
     case 5:
       for (uint8_t r = 0; r < NUM_ROWS; r++)
         for (uint8_t c = 0; c < TOTAL_COLS / 2; c++) greenBuf[r][c] = GREEN_ON;
-      name   = "LEFT HALF green";
-      expect = "left 8 modules AMBER, right 8 RED -> boundary shows bit ORDER"; break;
+      name = "LEFT HALF"; expect = "left 8 modules green, right 8 dark -> bit ORDER"; break;
 
     case 6:
       for (uint8_t c = 0; c < COLS_PER_MODULE; c++) greenBuf[0][c] = GREEN_ON;
-      name   = "FIRST MODULE, ROW 0 green";
-      expect = "5 amber pixels in ONE module -> which end is bit 0?"; break;
+      name = "FIRST MODULE, ROW 0"; expect = "5 green pixels in ONE module -> where is bit 0?"; break;
 
     case 7:
       for (uint8_t r = 0; r < NUM_ROWS; r++) {
         uint8_t c = (uint8_t)(r * 11);
         if (c < TOTAL_COLS) greenBuf[r][c] = GREEN_ON;
       }
-      name   = "DIAGONAL green";
-      expect = "amber diagonal stepping right and down -> row+column together"; break;
+      name = "DIAGONAL"; expect = "green diagonal stepping right and down"; break;
 
     case 8:
       for (uint8_t r = 0; r < NUM_ROWS; r++)
         for (uint8_t c = 0; c < TOTAL_COLS; c++)
           if ((c % 10) < 5) greenBuf[r][c] = GREEN_ON;
-      name   = "ALTERNATE MODULES green";
-      expect = "modules alternate amber/red -> proves module boundaries"; break;
+      name = "ALTERNATE MODULES"; expect = "modules alternate green/dark -> module boundaries"; break;
   }
 
   if (Serial) {
@@ -621,7 +663,7 @@ static void runPatternSequence(void) {
   si = (uint8_t)((si + 1) % (sizeof(safeSet)/sizeof(safeSet[0])));
   p = safeSet[si];
 #else
-  p = (uint8_t)((p + 1) % 9);
+  p = (uint8_t)((p + 1) % 11);
 #endif
   applyPattern(p);
 }
@@ -897,15 +939,19 @@ static const PinMapEntry pinMap[] = {
   { PIN_RCLK,  "RCLK",   "IDC 3"  },
   { PIN_R,     "R data", "IDC 6"  },
   { PIN_G,     "G data", "IDC 7"  },
-  { PIN_OE,    "OE",     "IDC 9"  },
   { PIN_ADDR0, "A0",     "IDC 11" },
   { PIN_ADDR1, "A1",     "IDC 13" },
   { PIN_ADDR2, "A2",     "IDC 15" },
 };
 #define PIN_MAP_COUNT (sizeof(pinMap) / sizeof(pinMap[0]))
 
+// OE is ACTIVE-HIGH on this panel (see setOE()), so LOW is blanked. It is also
+// deliberately NOT in pinMap[] above: asserting it for a 3-second test step would
+// hold the panel statically enabled, which is the condition that destroyed panel
+// 1's row drivers. OE is pinned LOW for the whole test and never walked.
 static void allPinsLow() {
   for (uint8_t i = 0; i < PIN_MAP_COUNT; i++) digitalWrite(pinMap[i].gpio, LOW);
+  digitalWrite(PIN_OE, LOW);   // blanked throughout, never asserted
 }
 
 static void runPinMapTest() {
@@ -919,7 +965,7 @@ static void runPinMapTest() {
     Serial.println("=== PIN MAP TEST ===");
     Serial.println("DMM in DC volts, black lead to GND, red lead on the named IDC pin.");
     Serial.println("Expect ~5V on the named pin only, ~0V on all others.");
-    Serial.println("Panel is never lit in this mode (OE asserted HIGH = blanked).");
+    Serial.println("Panel is never lit: OE is pinned LOW (blanked) and never walked.");
     Serial.println();
     announced = true;
     lastStep = millis() - PIN_MAP_DWELL_MS;  // start immediately
