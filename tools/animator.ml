@@ -397,17 +397,136 @@ let demo : anim =
   let words = marquee Amber 3 20. "  FLUX STAINED HEX  " in   (* 1 px/frame *)
   seq 10. sweeps (seq 8. words (speed 1. plasma))
 
+
+
+(* ------------------------------------------------------------------------ *)
+(* Plasma variants for the PIO driver (50 fps, all four levels)              *)
+(* ------------------------------------------------------------------------ *)
+(* The original [plasma] was tuned for 20 fps and paints one colour band per
+   pixel. These run at 50 fps and use TWO independent fields - one for red, one
+   for green - added with the panel's own additive mixing, so amber appears
+   wherever the fields overlap rather than being a fixed band. Brightness comes
+   from each field's own amplitude, quantised to the 4 levels. *)
+
+(* A generic field: sum of drifting sines in 0..1. *)
+let field ~fx ~fy ~fd ~s1 ~s2 ~s3 : float -> int -> int -> float =
+  fun t x y ->
+    let x = float x and y = float y in
+    let v = sin (x *. fx +. t *. s1)
+          +. sin (y *. fy +. t *. s2)
+          +. sin ((x *. 0.5 +. y) *. fd -. t *. s3)
+          +. sin (sqrt (x *. x *. 0.01 +. y *. y *. 0.3) +. t *. s1 *. 0.7) in
+    (v +. 4.) /. 8.
+
+let quant4 u = max 0 (min 3 (int_of_float (u *. 4.)))
+
+(* Two-field plasma: red and green fields drift at different rates, so the
+   colour composition itself evolves - amber blooms and dissolves. *)
+let plasma_dual : anim =
+  let fr = field ~fx:0.16 ~fy:0.6  ~fd:0.11 ~s1:1.1 ~s2:0.8 ~s3:0.6 in
+  let fg = field ~fx:0.13 ~fy:0.75 ~fd:0.09 ~s1:0.7 ~s2:1.2 ~s3:0.9 in
+  fun t x y ->
+    let r = quant4 (fr t x y -. 0.15)   (* bias so there is some dark *)
+    and g = quant4 (fg (t +. 3.) x y -. 0.15) in
+    px (mix (if r > 0 then Red else Off) (if g > 0 then Green else Off)) (max r g)
+
+(* Interference plasma: one field, but colour chosen by the SLOPE of the field
+   rather than its value, which gives moving contour lines instead of blobs. *)
+let plasma_contour : anim =
+  let f = field ~fx:0.2 ~fy:0.5 ~fd:0.14 ~s1:0.9 ~s2:1.0 ~s3:0.7 in
+  fun t x y ->
+    let v = f t x y in
+    let dv = f t (x + 1) y -. v in            (* horizontal slope *)
+    let level = quant4 v in
+    if level = 0 then off
+    else if dv > 0.03 then px Red level
+    else if dv < -0.03 then px Green level
+    else px Amber level
+
+(* Pulse plasma: the whole field breathes in brightness on a slow envelope
+   while its shape drifts, so the panel dims to nothing and blooms back. *)
+let plasma_pulse : anim =
+  let f = field ~fx:0.14 ~fy:0.65 ~fd:0.1 ~s1:1.3 ~s2:0.9 ~s3:0.5 in
+  fun t x y ->
+    let env = (sin (t *. 0.8) +. 1.) /. 2. in     (* 0..1, ~8s period *)
+    let v = f t x y *. env in
+    let level = quant4 v in
+    let c = match int_of_float (t /. 4.) mod 3 with 0 -> Amber | 1 -> Green | _ -> Red in
+    px c level
+
+let plasma_reel : anim =
+  seq 10. plasma_dual (seq 10. plasma_contour plasma_pulse)
+
+(* ------------------------------------------------------------------------ *)
+(* Showcase — designed to be IMPOSSIBLE on the bit-banged driver             *)
+(* ------------------------------------------------------------------------ *)
+(* Rasterised at 50 fps (set ANIM_FRAME_MS 20 in the firmware). At the old
+   ~46Hz repaint with 4 BCM levels, 50 fps playback would drop frames and every
+   fast edge would strobe. With PIO the repaint is several hundred Hz, so this
+   should be fluid.
+
+   Sections:
+     1. Brightness ladder  - 12 static bands: 3 colours x 4 levels. Proves the
+                             four levels are distinct and stable. If you see only
+                             two distinct brightnesses, BCM_LEVELS is 2.
+     2. Fast bouncer       - single bright pixel at 100 px/s with a 6-deep trail
+                             fading through all four levels. Strobes at low
+                             refresh; draws a smooth comet at high refresh.
+     3. Fast marquee       - text at 50 px/s (1 px/frame at 50 fps). The original
+                             demo was 20 px/s.
+     4. Colour sweep       - a wipe that crosses the panel 4 times a second. *)
+
+let ladder : anim =
+  fun _ x _ ->
+    (* 80 columns / 12 bands = 6.67 px each. Band index 0..11. *)
+    let band = min 11 (x * 12 / width) in
+    let colour = match band / 4 with 0 -> Red | 1 -> Green | _ -> Amber in
+    let level = band mod 4 in
+    px colour level
+
+let bouncer : anim =
+  (* Triangle wave over 0..79 at 100 px/s: one full bounce every 1.6s. *)
+  let pos t =
+    let p = mod_float (t *. 100.) (2. *. float (width - 1)) in
+    if p < float (width - 1) then int_of_float p
+    else int_of_float (2. *. float (width - 1) -. p) in
+  let dir t =   (* +1 moving right, -1 moving left *)
+    let p = mod_float (t *. 100.) (2. *. float (width - 1)) in
+    if p < float (width - 1) then 1 else -1 in
+  let head c = fun _ x y -> if x = 0 && y = 3 then px c 3 else off in
+  fun t x y ->
+    let c = match int_of_float (t /. 1.6) mod 3 with 0 -> Amber | 1 -> Red | _ -> Green in
+    (* trail extends BEHIND the direction of travel *)
+    let tr = trail 6 (- (dir t)) (head c) in
+    tr t (x - pos t) y
+
+let fast_marquee = marquee Green 3 50. "  PIO  DRIVER  "
+
+let sweep : anim =
+  fun t x _ ->
+    (* Wipe crossing the whole panel 4 times a second, colour changing each pass. *)
+    let pass = int_of_float (t *. 4.) in
+    let edge = int_of_float (mod_float (t *. 4.) 1. *. float width) in
+    let c = match pass mod 3 with 0 -> Red | 1 -> Amber | _ -> Green in
+    if x <= edge then px c (if edge - x < 6 then 3 else if edge - x < 14 then 2 else 1)
+    else off
+
+let showcase : anim =
+  seq 3. ladder (seq 5. bouncer (seq 5. fast_marquee sweep))
+
 (* ------------------------------------------------------------------------ *)
 (* Entry point                                                               *)
 (* ------------------------------------------------------------------------ *)
 
 let usage () =
   print_endline "usage:\n\
-  \  animator demo    frames.h\n\
+  \  animator demo     frames.h\n\
+  \  animator showcase frames.h        (50 fps - set ANIM_FRAME_MS 20)\n\
   \  animator pan     in.pan  frames.h\n\
   \  animator show    in.pan\n\
   \  animator life    frames.h [seconds]\n\
-  \  animator plasma  frames.h [seconds]\n\
+  \  animator plasma  frames.h [seconds]       (20 fps)\n\
+  \  animator plasma2 frames.h [seconds]       (50 fps - set ANIM_FRAME_MS 20)\n\
   \  animator marquee frames.h \"TEXT\""
 
 let () =
@@ -417,6 +536,9 @@ let () =
   match args with
   | ["demo"; out] ->
       emit_header (rasterise demo ~fps:20. ~seconds:24.) out
+  | ["showcase"; out] ->
+      (* 50 fps: set ANIM_FRAME_MS 20 in the firmware to match. *)
+      emit_header (rasterise showcase ~fps:50. ~seconds:16.) out
   | ["pan"; inp; out] ->
       emit_header (read_pan inp) out
   | ["show"; inp] ->
@@ -427,6 +549,9 @@ let () =
       emit_header (rasterise a ~fps:8. ~seconds:(secs_or 20. rest)) out
   | "plasma" :: out :: rest ->
       emit_header (rasterise plasma ~fps:20. ~seconds:(secs_or 10. rest)) out
+  | "plasma2" :: out :: rest ->
+      (* 50 fps: dual-field, contour and pulse plasmas. ANIM_FRAME_MS 20. *)
+      emit_header (rasterise plasma_reel ~fps:50. ~seconds:(secs_or 30. rest)) out
   | ["marquee"; out; s] ->
       (* 20 px/s at 20 fps = 1 px/frame, so scrolling is perfectly even. *)
       let a = marquee Amber 3 20. s in
