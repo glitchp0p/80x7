@@ -909,7 +909,7 @@ static const uint8_t font5x7[10][7] = {
 #define ANIM_MODE 1
 // MUST match the fps the frames were rasterised at, or motion stutters: the
 // animator's default is 20 fps, so 50ms. A mismatch drops or repeats frames.
-#define ANIM_FRAME_MS 20        // showcase is rasterised at 50 fps
+#define ANIM_FRAME_MS 33        // 30 fps video; use 20 for the 50 fps showcase/plasma2
 
 #if ANIM_MODE
 #include "frames.h"

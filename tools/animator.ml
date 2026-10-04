@@ -52,6 +52,8 @@ let opaque p = p.colour <> Off && p.level > 0
 
 let colour_code = function Off -> 0 | Red -> 1 | Green -> 2 | Amber -> 3
 
+let quant4 u = max 0 (min 3 (int_of_float (u *. 4.)))
+
 let encode p =
   if not (opaque p) then 0 else (colour_code p.colour lsl 2) lor p.level
 
@@ -206,6 +208,15 @@ let font5x7 c =
   | '.' -> [|0;0;0;0;0;0x0C;0x0C|]
   | ':' -> [|0;0x0C;0x0C;0;0x0C;0x0C;0|]
   | '!' -> [|0x04;0x04;0x04;0x04;0x04;0;0x04|]
+  | '?' -> [|0x0E;0x11;0x01;0x02;0x04;0;0x04|]
+  | ',' -> [|0;0;0;0;0x0C;0x0C;0x08|]
+  | '\'' -> [|0x04;0x04;0;0;0;0;0|]
+  | '/' -> [|0x01;0x02;0x02;0x04;0x08;0x08;0x10|]
+  | '+' -> [|0;0x04;0x04;0x1F;0x04;0x04;0|]
+  | '=' -> [|0;0;0x1F;0;0x1F;0;0|]
+  | '(' -> [|0x02;0x04;0x08;0x08;0x08;0x04;0x02|]
+  | ')' -> [|0x08;0x04;0x02;0x02;0x02;0x04;0x08|]
+  | '*' -> [|0;0x15;0x0E;0x1F;0x0E;0x15;0|]
   | _   -> [|0x1F;0x1F;0x1F;0x1F;0x1F;0x1F;0x1F|]  (* unknown = block *)
 
 (* Text as an anim at the origin, 6 pixels per character (5 + 1 gap). *)
@@ -287,6 +298,7 @@ let plasma : anim =
     | 3 -> px Amber 2 | 4 -> px Green 2
     | _ -> px Green 3
 
+
 (* ------------------------------------------------------------------------ *)
 (* Rasterising and output                                                    *)
 (* ------------------------------------------------------------------------ *)
@@ -303,6 +315,283 @@ let sample (a : anim) t : frame =
 let rasterise (a : anim) ~fps ~seconds : frame list =
   let n = int_of_float (fps *. seconds) in
   List.init n (fun i -> sample a (float i /. fps))
+
+(* ------------------------------------------------------------------------ *)
+(* Video import — rotoscope real footage                                      *)
+(* ------------------------------------------------------------------------ *)
+(* Reads raw RGB24 frames at 80x7 as produced by ffmpeg:
+
+     ffmpeg -i clip.mp4 -vf "crop=iw:ih/11.4,scale=80:7,fps=50" \
+            -f rawvideo -pix_fmt rgb24 clip.rgb
+
+   The crop takes a horizontal band from the middle of the frame at the panel's
+   11.4:1 aspect; "crop=iw:ih/11.4:0:Y" picks a different band. Then:
+
+     ./animator video clip.rgb frames.h
+
+   COLOUR MAPPING - no blue and only 4 levels, so this is a creative reduction:
+     level  <- luminance, AUTO-LEVELLED per clip (the 2nd..98th percentile is
+               stretched to 0..3) so exposure differences between clips do not
+               matter, then quantised with a small bias so the noise floor stays
+               dark.
+     colour <- red vs green balance: red-dominant pixels go red, green-dominant
+               go green, balanced go amber. Blue counts toward luminance only.
+   VIDEO_CHROMA sets how strongly a channel must dominate to be called red or
+   green rather than amber; lower it for more colour separation. *)
+
+let video_chroma = 1.35
+
+(* Sky handling. The panel has no blue, so blue sky and white cloud both look
+   "balanced" once blue is dropped and both map to amber - the whole sky becomes
+   one bright colour. With video_sky set, blue-DOMINANT pixels (sky) are demoted
+   so amber is left for genuinely warm things: clouds catching the sun, clover,
+   skin. Silhouettes then sit against a darker sky.
+     `Amber  - old behaviour, sky and cloud both amber
+     `Dim    - sky rendered dim green (level capped at 1); cloud stays amber
+     `Off    - sky rendered off; only clouds and warm things light *)
+let video_sky = `Dim
+
+let lum_of r g b = (0.30 *. float r +. 0.59 *. float g +. 0.11 *. float b) /. 255.
+
+let is_sky r g b = float b > float r *. 1.15 && float b > float g *. 1.15
+
+let colour_of r g =
+  let rf = float r and gf = float g in
+  if rf > gf *. video_chroma then Red
+  else if gf > rf *. video_chroma then Green
+  else Amber
+
+(* Colour AND level together, so the sky rule can cap brightness. *)
+let pixel_of r g b level =
+  if level = 0 then off
+  else if is_sky r g b then
+    (match video_sky with
+     | `Amber -> px (colour_of r g) level
+     | `Dim   -> px Green 1
+     | `Off   -> off)
+  else px (colour_of r g) level
+
+let read_rgb_video path : frame list =
+  let ic = open_in_bin path in
+  let len = in_channel_length ic in
+  let per_frame = width * height * 3 in
+  let n = len / per_frame in
+  let raw = Bytes.create (n * per_frame) in
+  really_input ic raw 0 (n * per_frame);
+  close_in ic;
+  let byte i = Char.code (Bytes.get raw i) in
+
+  (* Pass 1: luminance percentiles across the whole clip for auto-levels. *)
+  let lums = Array.init (n * width * height) (fun p ->
+    let i = p * 3 in lum_of (byte i) (byte (i + 1)) (byte (i + 2))) in
+  let sorted = Array.copy lums in
+  Array.sort compare sorted;
+  let pct q = sorted.(min (Array.length sorted - 1)
+                          (int_of_float (q *. float (Array.length sorted)))) in
+  let lo = pct 0.02 and hi = pct 0.98 in
+  (* If the clip is mostly one flat value (big sky, uniform field) the
+     percentiles coincide; fall back to true min/max so the small bright
+     features still get the full range. *)
+  let lo, hi = if hi -. lo < 0.05 then sorted.(0), sorted.(Array.length sorted - 1)
+               else lo, hi in
+  let span = if hi -. lo < 0.01 then 1. else hi -. lo in
+  Printf.printf "auto-levels: luminance %.2f..%.2f stretched to 0..3\n" lo hi;
+
+  (* Pass 2: quantise. *)
+  let frames = List.init n (fun f ->
+    Array.init height (fun y -> Array.init width (fun x ->
+      let p = (f * height + y) * width + x in
+      let i = p * 3 in
+      let u = (lums.(p) -. lo) /. span -. 0.08 in
+      let level = quant4 u in
+      pixel_of (byte i) (byte (i + 1)) (byte (i + 2)) level))) in
+  Printf.printf "read %d frames from %s\n" n path;
+  frames
+
+
+(* ---- Slit-scan ----
+   Sample ONE vertical column from every frame of a normal clip and lay the
+   samples side by side, so the horizontal axis becomes TIME. A train passing a
+   fixed camera yields a strip as long as the train; a person walking past
+   yields a strip of the person. The strip is arbitrarily wide by construction.
+   Then scroll the strip across the 80-column panel.
+
+   ffmpeg: keep the source width, only reduce height to 7 rows:
+     ffmpeg -i clip.mp4 -vf "crop=iw:ih/2:0:ih/4,scale=SRCW:7,fps=50" \
+            -f rawvideo -pix_fmt rgb24 clip.rgb
+   where SRCW is the source width in pixels (e.g. 1920). The crop picks the
+   vertical band of interest. Then:
+     ./animator slitscan clip.rgb frames.h SRCW [column] [px_per_frame]
+   column defaults to the centre; px_per_frame is scroll speed (1 = 1px/frame).
+
+   The camera must be STILL. Subject motion is what writes the strip; camera
+   motion smears it. *)
+
+let read_rgb_wide path srcw : (int * int * int) array array list =
+  let ic = open_in_bin path in
+  let len = in_channel_length ic in
+  let per_frame = srcw * height * 3 in
+  let n = len / per_frame in
+  let buf = Bytes.create per_frame in
+  let frames = List.init n (fun _ ->
+    really_input ic buf 0 per_frame;
+    Array.init height (fun y -> Array.init srcw (fun x ->
+      let i = (y * srcw + x) * 3 in
+      (Char.code (Bytes.get buf i), Char.code (Bytes.get buf (i+1)),
+       Char.code (Bytes.get buf (i+2)))))) in
+  close_in ic;
+  Printf.printf "read %d frames at %dx%d from %s\n" n srcw height path;
+  frames
+
+let slitscan path srcw column pxpf : frame list =
+  let src = read_rgb_wide path srcw in
+  let col = if column < 0 || column >= srcw then srcw / 2 else column in
+  (* Build the strip: one column per source frame. *)
+  let strip = Array.of_list (List.map (fun fr ->
+    Array.init height (fun y -> fr.(y).(col))) src) in
+  let n = Array.length strip in
+  (* Auto-level luminance across the strip. *)
+  let lums = Array.init (n * height) (fun p ->
+    let (r,g,b) = strip.(p / height).(p mod height) in lum_of r g b) in
+  let sorted = Array.copy lums in Array.sort compare sorted;
+  let pct q = sorted.(min (Array.length sorted - 1)
+                          (int_of_float (q *. float (Array.length sorted)))) in
+  let lo = pct 0.02 and hi = pct 0.98 in
+  let lo, hi = if hi -. lo < 0.05 then sorted.(0), sorted.(Array.length sorted - 1)
+               else lo, hi in
+  let span = if hi -. lo < 0.01 then 1. else hi -. lo in
+  let quant (r,g,b) =
+    let u = (lum_of r g b -. lo) /. span -. 0.08 in
+    let level = quant4 u in
+    pixel_of r g b level in
+  (* Scroll the strip: enter from the right, exit left. *)
+  let total = n + width in
+  let nframes = total / (max 1 pxpf) in
+  Printf.printf "slit-scan strip is %d columns; %d output frames\n" n nframes;
+  List.init nframes (fun f ->
+    let offset = f * pxpf - width in     (* strip column at panel x=0 *)
+    Array.init height (fun y -> Array.init width (fun x ->
+      let sx = offset + x in
+      if sx < 0 || sx >= n then off else quant strip.(sx).(y))))
+
+
+(* ------------------------------------------------------------------------ *)
+(* .ani — one character per pixel, hand-animated frames in a text file       *)
+(* ------------------------------------------------------------------------ *)
+(* An 80x7 frame is exactly 7 lines of 80 characters. One glyph per pixel
+   carries both colour and brightness, by weight:
+
+                dim   mid   bright
+       red       r     R      %
+       green     g     G      &
+       amber     a     A      @
+       off             .
+
+   FILE RULES
+     - lines beginning with # are comments (rulers, notes) and are ignored
+     - a frame is 7 consecutive non-comment lines
+     - "---" ends a frame; "--- x5" holds it for 5 output frames
+     - "===" means "same as the previous frame" (a hold without retyping)
+     - short lines are padded with off; long lines are truncated
+     - any unknown character is off
+
+   WORKFLOW
+     animator ani-new  anim.ani [frames]   write a template with a ruler
+     animator ani-show anim.ani            colour preview, off in dark grey
+     animator ani      anim.ani frames.h   build for the panel
+
+   Each frame is usually made by copying the previous one and editing it, so
+   the file reads as a flip-book top to bottom. *)
+
+let glyph_of_pixel p =
+  if not (opaque p) then '.'
+  else match p.colour, p.level with
+    | Red,   1 -> 'r' | Red,   2 -> 'R' | Red,   _ -> '%'
+    | Green, 1 -> 'g' | Green, 2 -> 'G' | Green, _ -> '&'
+    | Amber, 1 -> 'a' | Amber, 2 -> 'A' | Amber, _ -> '@'
+    | Off, _ -> '.'
+
+let pixel_of_glyph = function
+  | 'r' -> px Red 1   | 'R' -> px Red 2   | '%' -> px Red 3
+  | 'g' -> px Green 1 | 'G' -> px Green 2 | '&' -> px Green 3
+  | 'a' -> px Amber 1 | 'A' -> px Amber 2 | '@' -> px Amber 3
+  | _   -> off
+
+let ani_ruler () =
+  (* Two comment lines: tens and units, so columns can be counted. *)
+  let tens = String.init width (fun i -> if i mod 10 = 0 then Char.chr (Char.code '0' + (i / 10) mod 10) else ' ') in
+  let units = String.init width (fun i -> Char.chr (Char.code '0' + i mod 10)) in
+  "#" ^ tens ^ "\n#" ^ units
+
+let ani_new path nframes =
+  let oc = open_out path in
+  Printf.fprintf oc "# %s\n" path;
+  Printf.fprintf oc "# 80 x 7, one character per pixel.\n";
+  Printf.fprintf oc "#   red   r R %%   green g G &   amber a A @   off .\n";
+  Printf.fprintf oc "# --- ends a frame; --- x5 holds it 5 frames; === repeats the previous frame.\n";
+  Printf.fprintf oc "%s\n" (ani_ruler ());
+  for f = 1 to nframes do
+    Printf.fprintf oc "# frame %d\n" f;
+    for _ = 1 to height do Printf.fprintf oc "%s\n" (String.make width '.') done;
+    Printf.fprintf oc "---\n"
+  done;
+  close_out oc;
+  Printf.printf "wrote %s with %d blank frame(s)\n" path nframes
+
+let read_ani path : frame list =
+  let ic = open_in path in
+  let out = ref [] and cur = ref [] and prev = ref None in
+  let frame_of_lines lines =
+    let arr = Array.of_list (List.rev lines) in
+    Array.init height (fun y ->
+      Array.init width (fun x ->
+        if y < Array.length arr && x < String.length arr.(y)
+        then pixel_of_glyph arr.(y).[x] else off)) in
+  let emit fr n = for _ = 1 to n do out := fr :: !out done; prev := Some fr in
+  let hold_count s =
+    (* "--- x5" -> 5, "---" -> 1 *)
+    try Scanf.sscanf s "--- x%d" (fun n -> max 1 n) with _ -> 1 in
+  (try while true do
+    let line = input_line ic in
+    let t = String.trim line in
+    if t = "" || (String.length t > 0 && t.[0] = '#') then ()
+    else if String.length t >= 3 && String.sub t 0 3 = "---" then begin
+      if !cur <> [] then emit (frame_of_lines !cur) (hold_count t);
+      cur := []
+    end
+    else if t = "===" then begin
+      (match !prev with Some fr -> emit fr 1 | None -> ());
+      cur := []
+    end
+    else begin
+      cur := line :: !cur;
+      if List.length !cur = height then begin
+        (* frame complete without an explicit ---; keep collecting until one
+           arrives so "--- x5" can still apply. *)
+        ()
+      end
+    end
+  done with End_of_file -> ());
+  if !cur <> [] then emit (frame_of_lines !cur) 1;
+  close_in ic;
+  Printf.printf "read %d frame(s) from %s\n" (List.length !out) path;
+  List.rev !out
+
+let ani_show (frames : frame list) =
+  List.iteri (fun i fr ->
+    Printf.printf "--- frame %d ---\n" (i + 1);
+    Array.iter (fun row ->
+      Array.iter (fun p ->
+        if not (opaque p) then print_string "\027[90m.\027[0m"
+        else begin
+          let code = match p.colour, p.level with
+            | Red, 1 -> "31" | Red, 2 -> "31;1" | Red, _ -> "91;1"
+            | Green, 1 -> "32" | Green, 2 -> "32;1" | Green, _ -> "92;1"
+            | Amber, 1 -> "33" | Amber, 2 -> "33;1" | Amber, _ -> "93;1"
+            | _ -> "0" in
+          Printf.printf "\027[%sm%c\027[0m" code (glyph_of_pixel p)
+        end) row;
+      print_newline ()) fr) frames
 
 let emit_header (frames : frame list) path =
   let oc = open_out path in
@@ -418,7 +707,6 @@ let field ~fx ~fy ~fd ~s1 ~s2 ~s3 : float -> int -> int -> float =
           +. sin (sqrt (x *. x *. 0.01 +. y *. y *. 0.3) +. t *. s1 *. 0.7) in
     (v +. 4.) /. 8.
 
-let quant4 u = max 0 (min 3 (int_of_float (u *. 4.)))
 
 (* Two-field plasma: red and green fields drift at different rates, so the
    colour composition itself evolves - amber blooms and dissolves. *)
@@ -453,6 +741,46 @@ let plasma_pulse : anim =
     let level = quant4 v in
     let c = match int_of_float (t /. 4.) mod 3 with 0 -> Amber | 1 -> Green | _ -> Red in
     px c level
+
+
+(* ---- Plasma with text knocked out of it ----
+   The plasma never goes off: every pixel is red, green or amber at level 1-3,
+   so the panel is a continuous field of colour. The TEXT is the only dark
+   region - it is punched out of the plasma as it scrolls, so the words read as
+   holes in the field rather than as lit glyphs.
+
+   quant3 maps the field to levels 1..3 (never 0), which is what removes the off
+   state. Colour comes from the two-field balance as in plasma_dual. *)
+
+let quant3 u = 1 + max 0 (min 2 (int_of_float (u *. 3.)))
+
+let plasma_solid : anim =
+  let fr = field ~fx:0.16 ~fy:0.6  ~fd:0.11 ~s1:1.1 ~s2:0.8 ~s3:0.6 in
+  let fg = field ~fx:0.13 ~fy:0.75 ~fd:0.09 ~s1:0.7 ~s2:1.2 ~s3:0.9 in
+  fun t x y ->
+    let r = fr t x y and g = fg (t +. 3.) x y in
+    let colour =
+      if r > g +. 0.10 then Red
+      else if g > r +. 0.10 then Green
+      else Amber in
+    px colour (quant3 (max r g))
+
+(* Knock one anim out of another: wherever [mask] is lit, the result is OFF;
+   everywhere else it is [base]. The mask's own colour is irrelevant. *)
+let knockout (mask : anim) (base : anim) : anim =
+  fun t x y -> if opaque (mask t x y) then off else base t x y
+
+(* Scrolling text used purely as a mask. Speed in px/s; at 50 fps use a
+   multiple of 50 for whole-pixel steps. *)
+let text_mask speed (s : string) : anim =
+  let w = text_width s in
+  let period = float (w + width) /. speed in
+  loop period (fun t x y ->
+    let dx = width - int_of_float (t *. speed) in
+    text Amber 3 s t (x - dx) y)
+
+let plasma_text (s : string) : anim =
+  knockout (text_mask 50. s) plasma_solid
 
 let plasma_reel : anim =
   seq 10. plasma_dual (seq 10. plasma_contour plasma_pulse)
@@ -522,11 +850,17 @@ let usage () =
   print_endline "usage:\n\
   \  animator demo     frames.h\n\
   \  animator showcase frames.h        (50 fps - set ANIM_FRAME_MS 20)\n\
+  \  animator ani-new  anim.ani [frames]   template with ruler\n\
+  \  animator ani-show anim.ani            colour preview\n\
+  \  animator ani      anim.ani frames.h   build\n\
   \  animator pan     in.pan  frames.h\n\
+  \  animator video   clip.rgb frames.h      (raw rgb24 80x7 from ffmpeg)\n\
+  \  animator slitscan clip.rgb frames.h SRCW [column] [px_per_frame]\n\
   \  animator show    in.pan\n\
   \  animator life    frames.h [seconds]\n\
   \  animator plasma  frames.h [seconds]       (20 fps)\n\
   \  animator plasma2 frames.h [seconds]       (50 fps - set ANIM_FRAME_MS 20)\n\
+  \  animator plasmatext frames.h [TEXT]       text knocked out of solid plasma\n\
   \  animator marquee frames.h \"TEXT\""
 
 let () =
@@ -541,6 +875,19 @@ let () =
       emit_header (rasterise showcase ~fps:50. ~seconds:16.) out
   | ["pan"; inp; out] ->
       emit_header (read_pan inp) out
+  | "ani-new" :: path :: rest ->
+      ani_new path (match rest with n :: _ -> int_of_string n | [] -> 1)
+  | ["ani-show"; inp] ->
+      ani_show (read_ani inp)
+  | ["ani"; inp; out] ->
+      emit_header (read_ani inp) out
+  | ["video"; inp; out] ->
+      emit_header (read_rgb_video inp) out
+  | "slitscan" :: inp :: out :: srcw :: rest ->
+      let srcw = int_of_string srcw in
+      let col  = (match rest with c :: _ -> int_of_string c | [] -> -1) in
+      let pxpf = (match rest with _ :: p :: _ -> int_of_string p | _ -> 1) in
+      emit_header (slitscan inp srcw col pxpf) out
   | ["show"; inp] ->
       show (read_pan inp)
   | "life" :: out :: rest ->
@@ -549,6 +896,12 @@ let () =
       emit_header (rasterise a ~fps:8. ~seconds:(secs_or 20. rest)) out
   | "plasma" :: out :: rest ->
       emit_header (rasterise plasma ~fps:20. ~seconds:(secs_or 10. rest)) out
+  | "plasmatext" :: out :: rest ->
+      (* One full pass of the message; 50 fps, so ANIM_FRAME_MS 20. *)
+      let msg = (match rest with s :: _ -> s
+                 | [] -> "DO YOU HAVE ANY MORE OF THESE ANDY?") in
+      let secs = float (text_width msg + width) /. 50. in
+      emit_header (rasterise (plasma_text msg) ~fps:50. ~seconds:secs) out
   | "plasma2" :: out :: rest ->
       (* 50 fps: dual-field, contour and pulse plasmas. ANIM_FRAME_MS 20. *)
       emit_header (rasterise plasma_reel ~fps:50. ~seconds:(secs_or 30. rest)) out
