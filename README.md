@@ -34,16 +34,20 @@ green, IDC 7 is red.
 
 ## Firmware pin map (RP2040-Zero, contiguous GP4-GP11 into 245 A1-A8)
 
-| Signal | Zero pad | 245 A-side | 245 B-side | Panel IDC |
-|--------|----------|-----------|-----------|-----------|
-| SRCLK  | GP4  | pin 2 | pin 18 | 1 |
-| RCLK   | GP5  | pin 3 | pin 17 | 3 |
-| G data | GP6  | pin 4 | pin 16 | **5** |
-| R data | GP7  | pin 5 | pin 15 | **7** |
-| OE     | GP8  | pin 6 | pin 14 | 9 |
-| A0     | GP9  | pin 7 | pin 13 | 11 |
-| A1     | GP10 | pin 8 | pin 12 | 13 |
-| A2     | GP11 | pin 9 | pin 11 | 15 |
+| Signal | Zero pad | firmware macro | 245 A-side (in) | 245 B-side (out) | Panel IDC |
+|--------|----------|----------------|-----------------|------------------|-----------|
+| SRCLK  | GP4  | `PIN_SRCLK` | A1 — pin 2 | B1 — pin 18 | 1 |
+| RCLK   | GP5  | `PIN_RCLK`  | A2 — pin 3 | B2 — pin 17 | 3 |
+| G data | GP6  | `PIN_G`     | A3 — pin 4 | B3 — pin 16 | **5** |
+| R data | GP7  | `PIN_R`     | A4 — pin 5 | B4 — pin 15 | **7** |
+| OE     | GP8  | `PIN_OE`    | A5 — pin 6 | B5 — pin 14 | 9 |
+| A0     | GP9  | `PIN_ADDR0` | A6 — pin 7 | B6 — pin 13 | 11 |
+| A1     | GP10 | `PIN_ADDR1` | A7 — pin 8 | B7 — pin 12 | 13 |
+| A2     | GP11 | `PIN_ADDR2` | A8 — pin 9 | B8 — pin 11 | 15 |
+| GND    | GND  | —           | pin 10     | —                | 2 |
+
+G and R must stay on consecutive GPIOs (G = GP6, R = GP7): the PIO driver sets
+both with one `out pins, 2` instruction.
 
 245 fixed pins: 1 (DIR) and 20 (VCC) to 5V; 10 (GND) and 19 (/OE) to GND; 100nF
 X7R across 20 and 10. B-side runs backwards (B1 = pin 18 ... B8 = pin 11).
@@ -96,7 +100,79 @@ linearly, all thermally safe. Capped at `BRIGHTNESS_MAX_US` (64); values above
 are silently clamped by the preprocessor.
 
 Per-colour dimming via `RED_DUTY` / `GREEN_DUTY` out of `DUTY_STEPS` sub-frames.
-Refresh divides by DUTY_STEPS, so 4 steps takes ~186 fps to ~46, near flicker.
+Refresh divides by DUTY_STEPS. With the old bit-banged shift, 4 steps took ~186 fps
+down to ~46, near flicker; the PIO driver (below) removes most of that cost.
+
+## PIO shift driver
+
+The row data is now clocked out by a PIO state machine instead of
+`digitalWrite()`. No wiring change — same GPIOs. Set by `PIO_DRIVER 1` in
+`main.cpp`; the bit-banged `shiftOutRowL()` is kept as the `#else` fallback.
+
+- **State machine:** pio0 SM1 (SM0 is the WS2812 heartbeat on GP16).
+- **Program**, 2 instructions, wrapping:
+  `out pins, 2 side 0 [3]` (drive G,R, SRCLK low) then `nop side 1 [3]` (SRCLK
+  high, 595 samples). SRCLK is side-set; G/R are the out pins.
+- **Speed:** SRCLK = sys_clk / (`PIO_CLKDIV` × 8). At 133 MHz and clkdiv 4 that is
+  ~4.2 MHz, against the original controller's 1.14 MHz. Raise `PIO_CLKDIV` if
+  columns ever look shifted or garbled.
+- **Data format:** 16 pixels per 32-bit word, 2 bits per pixel (bit 0 = G line,
+  bit 1 = R line, raw active-low levels), pixel 0 first. 80 pixels = 5 words
+  per row. OSR shifts right with autopull at 32.
+- **Still on the CPU:** RCLK, OE and the address lines change once per row,
+  not per bit, so they stay as plain GPIO writes. The CPU also packs each row
+  into words and waits for the SM to go idle (`panelPioWaitIdle()`, which waits
+  for the TX-stall flag, not just an empty FIFO) before latching.
+- **Only used in `MODE_RUN`.** Diagnostic and replay modes still bit-bang.
+
+The shift-time figures in "Driver structure" and "Brightness" (~400 µs per slot,
+~186 fps) were measured with the bit-banged driver and are stale. Re-measure
+before relying on them.
+
+## Animation pipeline — `tools/animator.ml`
+
+OCaml tool that generates `src/frames.h`. An animation is a function
+`time -> x -> y -> pixel`; effects are functions from animation to animation,
+so they compose. Frames only exist when it's sampled at a fixed rate and
+written out.
+
+Build (from `tools/`):
+
+```
+ocamlfind ocamlopt -package str -linkpkg animator.ml -o animator
+# or without ocamlfind:
+ocamlopt str.cmxa animator.ml -o animator
+```
+
+Commands (run `./animator` with no arguments for the full list):
+
+| Command | Output |
+|---------|--------|
+| `demo frames.h` | built-in demo reel, 20 fps |
+| `showcase frames.h` | showcase reel, 50 fps |
+| `plasma frames.h [s]` / `plasma2 frames.h [s]` | plasma, 20 fps / 50 fps |
+| `plasmatext frames.h [TEXT]` | text knocked out of solid plasma |
+| `marquee frames.h "TEXT"` | scrolling text |
+| `life frames.h [s]` | Game of Life |
+| `pan in.pan frames.h` / `show in.pan` | hand-drawn `.pan` file / terminal preview |
+| `ani-new` / `ani-show` / `ani` | `.ani` template, preview, build |
+| `video clip.rgb frames.h` | raw rgb24 80×7 from ffmpeg |
+| `slitscan clip.rgb frames.h SRCW [col] [px]` | slit-scan from a wider clip |
+
+For video, convert first with ffmpeg, e.g.
+`ffmpeg -i clip.mp4 -vf "crop=iw:ih/11.4,scale=80:7,fps=50" -f rawvideo -pix_fmt rgb24 clip.rgb`.
+
+**`frames.h` format:** 560 bytes per frame (80 × 7), one byte per pixel, rows
+top-first and columns left-first *as a viewer sees the panel*. Bits 3:2 = colour
+(0 off, 1 red, 2 green, 3 amber), bits 1:0 = brightness level 0–3. The firmware's
+`renderFrame()` applies all three geometry inversions, so frames are authored
+the way they look.
+
+**Playback:** `ANIM_MODE 1` in `main.cpp`. **`ANIM_FRAME_MS` must equal
+1000 / the fps the frames were made at** (50 for 20 fps, 33 for 30 fps, 20 for
+50 fps), or frames are dropped or repeated. The 4 brightness levels come from
+`levelBuf` / `BCM_LEVELS 4`; the 50 fps effects rely on the PIO driver's faster
+repaint.
 
 ## Hardware damage (panel 1)
 
@@ -173,6 +249,8 @@ there is no separate third color die.
 
 ## Confirmed 20-pin IDC connector pinout
 
+> **Superseded (see top block):** IDC 6 is GND, not R data. G data is on IDC 5 and R data on IDC 7. Pins 4 and 8 are GND. OE is active-HIGH, not active-low. Pins 16–20 are still unmapped.
+
 | Pin | Signal | Notes |
 |-----|--------|-------|
 | 1   | **SRCLK** | Shift register clock. ~1.14MHz, narrow active pulses (~1-2 samples @ 24MHz, ~42-83ns) |
@@ -211,6 +289,8 @@ disagreed; re-check anything marginal on the second one.
   independent ways: (1) directly counting SRCLK edges between RCLK pulses,
   (2) matches the known module/column count.
 - **Row address (A0-A2) cycles 7→0→7→0…**, i.e. counts *down*, wrapping at 0.
+> **Superseded (see top block):** the two loads per address are a pipeline (each address shows the data shifted during the previous slot), not 2-level BCM. See "Driver structure".
+
 - **Each address value is held for exactly 2 consecutive RCLK loads** — a
   2-level brightness/BCM scheme (dim/bright weighting), not full grayscale.
   So: 8 address states × 2 loads = 16 loads per full frame.
@@ -248,8 +328,8 @@ where the column says otherwise.
 |--------|----------|----------------|-----------------|------------------|-----------|
 | SRCLK  | GP4  | `PIN_SRCLK` | A1 — pin 2 | B1 — pin 18 | pin 1 |
 | RCLK   | GP5  | `PIN_RCLK`  | A2 — pin 3 | B2 — pin 17 | pin 3 |
-| R data | GP6  | `PIN_R`     | A3 — pin 4 | B3 — pin 16 | pin 6 |
-| G data | GP7  | `PIN_G`     | A4 — pin 5 | B4 — pin 15 | pin 7 |
+| G data | GP6  | `PIN_G`     | A3 — pin 4 | B3 — pin 16 | pin 5 |
+| R data | GP7  | `PIN_R`     | A4 — pin 5 | B4 — pin 15 | pin 7 |
 | OE     | GP8  | `PIN_OE`    | A5 — pin 6 | B5 — pin 14 | pin 9 |
 | A0     | GP9  | `PIN_ADDR0` | A6 — pin 7 | B6 — pin 13 | pin 11 |
 | A1     | GP10 | `PIN_ADDR1` | A7 — pin 8 | B7 — pin 12 | pin 13 |
@@ -312,7 +392,7 @@ the 245's contiguous runs. 74HCT125 is reserved for the MIDI clock project.
 | 100nF X7R ceramic | 1+ | Decoupling at 245 VCC/GND | In hand |
 | 10–100µF electrolytic/tant | 1 | Optional bulk at panel 5V entry | — |
 | 1Ω 5W resistor | 1 | Inline current-sense shunt in 5V feed | Needed |
-| Raspberry Pi Pico (RP2040) | 1 | Replacement controller | In hand |
+| RP2040-Zero (V1083 clone) | 1 | Replacement controller | In hand |
 | 20-pin IDC header + cable | 1 | Panel connection | — |
 | DIP socket, 20-pin | 1 | For the 245 (don't solder it in directly) | — |
 
@@ -321,6 +401,8 @@ APM4953 dual P-ch MOSFET, HR1–HR7 resistor networks, 16 × 5×7 bi-color
 modules. **Fixed 5V supply only — no current-limited bench supply yet.**
 
 ## Root cause found: firmware pin defines never matched the harness
+
+> **Note:** the GPIO numbers in the table below are the harness as it was *then*. The IDC 6/7 data assignments are also wrong (IDC 6 is GND). The current wiring is in the top block. `FORCE_OE_DISABLED` is now `false`, and OE is active-HIGH, not active-low.
 
 **This, not level shifting, is why the panel never responded to firmware.**
 The `#define` block in `main.cpp` used placeholder GPIOs 2–9. Continuity
@@ -365,6 +447,8 @@ masked by this one, and fixing it alone would not have made the panel work.
 
 ## Target board: RP2040-Zero (V1083 clone), not a Pico
 
+> **Note:** the logic-analyzer heartbeat has moved from GP8 to GP12 (`PIN_HEARTBEAT`). GP8 is now OE.
+
 Confirmed — the silkscreen numbers on this board **are GP numbers**, since the
 Zero labels its castellated pads with GPIO directly. (The physical-vs-GP
 mismatch that trips people up is a Pico-with-40-pin-header issue; it does not
@@ -395,6 +479,8 @@ debugprobe (GP2=SWCLK, GP3=SWDIO, GP4/5=UART). No electrical conflict — differ
 board, different job — but they are physically indistinguishable.
 
 ## Observation log — display states vs. driven signals
+
+> **Superseded (see top block):** this whole log was recorded while red data was wired to a GROUND pin (IDC 6) and before OE's polarity was known. Its polarity, blank-state and "OE does not blank" conclusions are all invalid. Dark is now BOTH lines HIGH, and OE does blank (active-HIGH).
 
 Recorded live during bring-up. Each row pairs a known set of driven line values
 with the observed display. Treated as a dataset, these constrain the hardware
@@ -496,6 +582,8 @@ results with IDC 9 at 5V and at GND. The 245's B5 output was almost certainly
 still connected and driving the pin, so the jumper was fighting it and the test
 measured nothing. OE works.
 
+> **Superseded (see top block):** this result was still taken with red on a ground pin. BOTH lines are active-LOW (`RED_ACTIVE_LOW 1`, `GREEN_ACTIVE_LOW 1`).
+
 **Polarity, finally.** The replayed red channel is all zeros across the entire
 frame and red digits appeared, while green carried 1052 ones out of 1360 and
 formed the background field. So: **RED is active-LOW (0 = lit), GREEN is
@@ -503,6 +591,8 @@ active-HIGH (1 = lit).** The per-colour asymmetry was real; both earlier
 attempts had the values inverted.
 
 ### New observations from the working display
+
+> **Superseded (see top block):** the "stuck" row was the pipeline seam at the first address of each frame, fixed by `PIPELINE_PRIME 1`, and was seen on both panels. It was not a hardware fault in that row.
 
 **Bottom row is faulty.** Red is markedly dimmer there and green does not light
 at all. The bottom row has been anomalous in *every* observation this session.
@@ -554,6 +644,8 @@ self-limiting, not runaway: the rising series-resistor and MOSFET on-resistance
 outweigh the LEDs' falling forward voltage. Red areas end up mildly warm, green
 stays cool.
 
+> **Note:** 2.67 A was measured in REPLAY_MODE, with the shift running while lit. The current driver blanks during the shift and draws ~0.17 A (8 µs) to ~0.7 A (64 µs). Treat 2.67 A as a replay-mode figure, not the normal operating point.
+
 **Conclusion: 2.67 A at 5 V is this panel's normal operating point and it is
 stable indefinitely.** No need for short runs, thermal watching, or current
 limiting during testing. Judge anything anomalous against this baseline.
@@ -563,6 +655,8 @@ does not. Three successive predictions about this panel's power behaviour were
 wrong in different directions — prefer measurement over reasoning on this board.)
 
 ### Brightness control: mechanism still UNKNOWN
+
+> **Superseded (see top block):** brightness is set by `ROW_ON_TIME_US` (see "Brightness"). These tests ran with OE's polarity inverted, so the panel was lit during the ~400 µs shift and the OE window was a small fraction of on-time. That is consistent with changing it having no visible effect.
 
 Two candidate controls were tested and neither affects current:
 
@@ -587,12 +681,16 @@ entered earlier have been visible longer within each frame.
 
 ### Frame structure confirmed from capture analysis
 
+> **Superseded (see top block):** the two loads are pipelined row data, not bit-planes. The firmware's per-pixel brightness now comes from its own BCM (`levelBuf`, `BCM_LEVELS`), not from the original's load structure.
+
 The two loads at each address carry **identical red data but DIFFERENT green
 data**. They are genuine independent bit-planes — the original's 2-level
 brightness weighting — not a duplicated frame. The previous `refreshFrame()`
 shifted the same buffer twice and discarded that distinction.
 
 ## Row addressing — MEASURED, and it is not what was assumed
+
+> **Superseded (see top block):** the firmware uses `BLANK_ADDR -1`, so addresses 0–6 map to rows 0–6 and every address gets real data. The bullets below also contradict each other (address 7 is called the spare, but skipping it darkened the bottom row). These measurements predate the pipeline fix and are probably confounded by it. The `rowIndex` paragraph is stale.
 
 Established by selectively skipping addresses (`SKIP_ADDR`) during a slow scan:
 
@@ -680,6 +778,8 @@ making the panel work harder.
 
 ## Known firmware bugs (found by cross-checking `main.cpp` against captures)
 
+> **Superseded (see top block):** bugs 1–3 assume the BCM bit-plane and dummy-address-0 theories, both now disproved. Bug 4 is fixed: separate `blankPadRed`/`blankPadGreen` arrays are memset explicitly. Bug 5's figures are bit-bang era, and the PIO driver has changed the timing again.
+
 **1. Only one of the two bit-planes is ever displayed.**
 In `refreshFrame()`, both planes are shifted and latched back-to-back
 *before* `setRowAddress()` and `setOE(true)` are called. Plane 0's latch is
@@ -716,6 +816,8 @@ of it. Expect the panel to be noticeably dimmer than original, not hotter.
 don't scale it from the old numbers.
 
 ## RP2040 bring-up progress
+
+> **Superseded (see top block):** the toolchain is now `board = waveshare_rp2040_zero` with the earlephilhower core, so `Serial.printf` works. `LED_ON`/`LED_OFF` has been replaced by per-colour `RED_ON/OFF`, `GREEN_ON/OFF`, both active-LOW. `ROW_ON_TIME_US` is now 64. Test selection is the single `MODE` switch.
 
 Toolchain: PlatformIO, Arduino/mbed framework, board `pico`.
 
@@ -765,6 +867,8 @@ code. Harmless, but tidy it up before it misleads someone.
   verified.
 - Start tests on a single module, not the full array.
 
+> **Note:** "Root cause found" above attributes this heating to the miswired pins (garbage data, OE driven by A2). Probably no longer open.
+
 **Still open from bring-up:** specific modules (5th, 6th, 10th, 11th from
 left) warmed faster than the rest during live testing, at a point when
 firmware data provably had no effect on the display. More likely a
@@ -772,6 +876,8 @@ hardware-side fault local to those modules (bad joint, weak driver) than a
 data problem — revisit after the level-shifted bring-up.
 
 ## Open questions / not yet confirmed
+
+> **Superseded (see top block):** Q1 resolved: both lines active-LOW. Q2 resolved: address 0 is a real row. Q3 resolved: bits enter at the left, and "Geometry" gives the inversions. Q4 is partly resolved: 4, 6 and 8 are GND, 5 is G data, 16–20 still unmapped. Q5 resolved: pipelining, not brightness planes.
 
 1. **R/G active polarity ("on" = 0 or 1).** Evidence is mixed:
    - G data is mostly HIGH (~97-98% duty) with sparse LOW bits scattered
