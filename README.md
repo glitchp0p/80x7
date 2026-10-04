@@ -1,6 +1,6 @@
-# Hospital LED Display — RP2040 driver
+# 80x7 LED Display — RP2040 driver
 
-![Panel running plasma animation](hospital.gif)
+![Panel running plasma animation](hospital_rot.gif)
 
 Salvaged 16-module bi-colour (red/green) 5×7 LED dot-matrix display, 80×7
 pixels, originally driven by an NXP LPC1768 on a plug-in daughterboard. The

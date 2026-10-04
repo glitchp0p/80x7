@@ -1,0 +1,11 @@
+# PlatformIO build output
+.pio/
+
+# OCaml animator build output (rebuild from tools/animator.ml)
+tools/animator
+tools/*.cmi
+tools/*.cmx
+tools/*.o
+
+# Local backups
+*.bak
