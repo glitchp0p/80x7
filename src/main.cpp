@@ -1,14 +1,12 @@
 // Hospital LED matrix panel driver — RP2040 replacement for original LPC1768 controller.
 //
-// This is a FIRST DRAFT built directly from reverse-engineered capture data — see README.md
-// for the full writeup. Several details are marked TODO because they're still unconfirmed
-// (see "Open questions" in README.md). Treat this as a test harness to validate those
-// assumptions against the real panel, not a finished driver.
+// Working driver. README.md describes the current, confirmed behaviour (wiring,
+// polarity, geometry, driver structure, brightness, PIO driver, animation).
+// debug_log.md holds the bring-up history; comments here that mention old theories
+// or "open questions" by number refer to that log.
 //
-// Bit-banged for now (simple, easy to debug with a logic analyzer alongside it). Once the
-// protocol is fully validated, this is a good candidate to move to RP2040 PIO for cleaner
-// timing and to free up the CPU core, especially if a scanning/animation refresh rate ends
-// up needing more headroom than bit-banging comfortably gives.
+// MODE_RUN shifts row data with a PIO state machine (PIO_DRIVER). The diagnostic and
+// replay modes still bit-bang, which keeps them easy to read on a logic analyzer.
 
 #include <Arduino.h>
 #include <string.h>
@@ -150,8 +148,9 @@ static void ws2812_put(uint8_t r, uint8_t g, uint8_t b) {
 #define COLS_PER_MODULE    5
 #define TOTAL_COLS         (NUM_MODULES * COLS_PER_MODULE)  // 80
 #define NUM_ROWS           7   // physical row commons H1-H7
-#define NUM_ADDR_STATES    8   // A0-A2 cycles 0-7 (addr 0 believed non-physical, see README)
-#define BITPLANES_PER_ROW  2   // 2 loads observed per address value
+#define NUM_ADDR_STATES    8   // A0-A2 cycles 0-7; addresses 0-6 are real rows (BLANK_ADDR -1)
+#define BITPLANES_PER_ROW  2   // 2 loads per address in the capture - pipelining, NOT bit-planes.
+                               // Only used by the old diagnostic / commented-out code.
 
 // ---- LED polarity — INDEPENDENT PER COLOUR ----
 // The red and green chains on this panel have OPPOSITE polarity. Observed directly:
@@ -192,9 +191,8 @@ static void ws2812_put(uint8_t r, uint8_t g, uint8_t b) {
 #endif
 
 // Frame buffer: one bit per (row, column), one array per color.
-// Index [0] corresponds to address value 0 (currently treated as blank/dummy — see below).
-// Real rows are addresses 1-7 mapped to physical rows H1-H7 — TODO confirm this mapping,
-// it's currently just assumed identity (addr N -> row N) with no evidence either way.
+// Index N is row address N (0-6). Buffer row 0 is at the BOTTOM of the panel - see
+// "Geometry" in README.md.
 static uint8_t redBuf[NUM_ROWS][TOTAL_COLS];
 static uint8_t greenBuf[NUM_ROWS][TOTAL_COLS];
 
@@ -220,27 +218,13 @@ static inline void pulseRCLK() {
   delayMicroseconds(1);
 }
 
-// SAFETY: panel modules were observed overheating during bring-up testing — almost
-// certainly because bit-banged digitalWrite() on this core is much slower than the
-// original ~1.14MHz protocol timing, so OE ends up enabled for a much larger fraction
-// of time than the low-duty pulses seen in the original captures. Until real OE/SRCLK
-// timing has been verified at the Pico's own GPIO pins (panel disconnected) with a
-// logic analyzer, FORCE_OE_DISABLED keeps the panel permanently blanked so it's safe
-// to flash and run without risk of sustained drive current. Only set this to false
-// once you've confirmed OE duty cycle is genuinely low via direct measurement.
-// SAFETY-CRITICAL: real per-row OE enable time on the original hardware was ~7-8us
-// (measured from the very first captures), not the 70us this firmware used initially.
-// That 9x-too-long window is the confirmed cause of the panel heating during bring-up
-// (measured actual enabled duty was ~18.8% here vs ~6.4% on the original board).
-// Start LOW and only increase gradually while monitoring temperature and using a
-// current-limited supply — do not jump back up toward 70us.
+// Lit window per row, in us. This is the global brightness control. Clamped to
+// BRIGHTNESS_MAX_US below. Bit-banged measurements: 8us ~0.17A, 64us ~0.7A.
+// The PIO driver shifts much faster, so the lit fraction of each slot is higher -
+// re-measure panel current before relying on those figures (see README "Brightness").
 #define ROW_ON_TIME_US 64
 
-// Set to 1 to run the walking-column diagnostic, 0 to hold a completely blank frame.
-// Start with 0 — if modules 5/6/10/11 still heat with NOTHING commanded on, that's a
-// hardware fault local to those modules, not a firmware bug. If they stay cool blank
-// but heat again once RUN_WALK_TEST is re-enabled, the problem is in the data framing
-// (likely the shift/latch structure assumption — see README open question #3 area).
+// Set to 1 to run the walking-column diagnostic (bring-up aid; see debug_log.md).
 #define RUN_WALK_TEST 0
 
 // ---- PIN_MAP_TEST: static pin-mapping verification with a DMM ----
@@ -258,17 +242,11 @@ static inline void pulseRCLK() {
 // blanked/safe state — this test never lights the panel.
 #define PIN_MAP_DWELL_MS 3000
 
-// WARNING (2026-09-10): OE APPEARS NOT TO WORK ON THIS PANEL.
-// Tying IDC pin 9 hard to 5V and hard to GND produced IDENTICAL output (bottom row lit
-// bright). Continuity from 245 pin 14 (B5) to IDC 9 is good, and IDC 9 is not shorted to
-// either rail. So either IDC 9 is not the panel's output-enable, or it is gated behind
-// the panel's own per-module 74HC245 buffers and never reaches the 595 /OE lines.
-// CONSEQUENCE: FORCE_OE_DISABLED PROTECTS NOTHING. Data polarity is currently the only
-// working blanking mechanism — which is why INVERT_POLARITY matters for safety, not just
-// for correct display. Keep runs short and check panel temperature by hand.
-#define FORCE_OE_DISABLED false   // SAFE DEFAULT after the pin-mapping fix:
-                                 // keep the panel blanked until the corrected mapping
-                                 // has been verified on a logic analyzer.
+// Set true to hold OE permanently blanked (PIN_OE LOW) - e.g. to check timing on a
+// logic analyzer without lighting the panel. OE does blank this panel (it is
+// ACTIVE-HIGH); the 2026-09-10 "OE does nothing" result was a test artefact - see
+// debug_log.md.
+#define FORCE_OE_DISABLED false
 
 // ---- OE POLARITY: ACTIVE-HIGH on this panel ----
 // Derived from three measured states, not from the capture. Shifting is the long
@@ -313,9 +291,9 @@ static inline void setRowAddress(uint8_t addr) {
 }
 
 // Shifts 80 bits of column data (one row's worth) into the R and G chains in parallel.
-// TODO (README open question #3): bit order within the 80 assumed sequential
-// module0-col0..col4, module1-col0..col4, ... module15-col0..col4. Not yet verified —
-// if the lit pattern comes out mirrored or module-shuffled, this is the first place to look.
+// Bit order: buffer column N is shifted Nth. The physical mapping is inverted -
+// column 0 within a module is on the RIGHT and modules run RIGHT-TO-LEFT - see
+// "Geometry" in README.md. renderFrame() applies this for animations.
 //
 // DIAGNOSTIC: added explicit setup-time delay before the clock edge, and hold-time delays
 // inside pulseSRCLK(). Testing the theory that a blank/constant buffer works correctly but
@@ -356,18 +334,18 @@ static inline bool greenSuppressed(void) { return false; }
 static inline void advanceGreenSubFrame(void) { }
 #endif
 
-// ---- PER-PIXEL BRIGHTNESS (BCM) ----
-// levelBuf holds a brightness level 0..BCM_LEVELS-1 for every pixel. Each refresh
-// is one BCM phase; a pixel is lit on phase P only if its level is greater than P.
-// Level 0 = never lit, BCM_LEVELS-1 = lit on every phase (full brightness).
+// ---- PER-PIXEL BRIGHTNESS ----
+// levelBuf holds a brightness level 0..BCM_LEVELS-1 for every pixel. Despite the
+// name this is plain duty-cycle PWM, not binary-coded modulation: each refresh is
+// one phase, the phase cycles 0..BCM_LEVELS-2, and a pixel is lit on phase P only
+// if its level is greater than P. With BCM_LEVELS 4 there are 3 phases, so
+// levels 0/1/2/3 are lit on 0/1/2/3 of every 3 refreshes = off, 1/3, 2/3, full.
 //
-// This is only possible now that a genuine DARK state exists (both lines off).
-// While red was shorted to a ground pin, every pixel always showed something, so
-// suppressing a colour swapped hue instead of dimming.
+// (It used to cycle BCM_LEVELS phases, which left the top level at 3/4 and made
+// full brightness unreachable.)
 //
-// COST: refresh rate divides by BCM_LEVELS. ~186 fps / 4 = ~46 fps, which is near
-// the flicker threshold on a panel this size. Moving the driver to PIO is the
-// proper fix; until then keep BCM_LEVELS small.
+// COST: a full brightness cycle takes BCM_LEVELS-1 refreshes. Cheap with the PIO
+// driver; with the bit-banged fallback keep BCM_LEVELS small to stay above flicker.
 // Blanking guard around the latch and address change. The row drivers and the
 // '138 take a finite time to settle; if OE is re-asserted too soon after the
 // address changes, a row briefly shows the PREVIOUS row's latched data. That
@@ -382,7 +360,7 @@ static uint8_t levelBuf[NUM_ROWS][TOTAL_COLS];
 static uint8_t bcmPhase = 0;
 
 static inline void advanceBcmPhase(void) {
-  bcmPhase = (uint8_t)((bcmPhase + 1) % BCM_LEVELS);
+  bcmPhase = (uint8_t)((bcmPhase + 1) % (BCM_LEVELS - 1));
 }
 
 // ============================================================================
@@ -504,7 +482,10 @@ static void shiftOutRow(const uint8_t *redRow, const uint8_t *greenRow) {
 
 
 // Drives one full frame: 8 address states, 2 loads each, matching captured timing.
-// FIX (was README open question #2 / a standing TODO): the original hardware's address-0
+// HISTORICAL (was open question #2 in debug_log.md). The address-0 / 160-bit theory
+// below was later replaced by PIPELINE_PRIME, and BLANK_ADDR is now -1, so these pad
+// rows are only used if BLANK_ADDR is re-enabled. Original note:
+// the original hardware's address-0
 // SECOND load was always 160 bits, not 80, in every capture. This firmware was never
 // updated to match — it just shifted 80 bits regardless of address, leaving the back half
 // of the real chain holding stale data from the previous cycle. That's the likely cause of
@@ -517,31 +498,9 @@ static void shiftOutRow(const uint8_t *redRow, const uint8_t *greenRow) {
 static uint8_t blankPadRed[TOTAL_COLS];
 static uint8_t blankPadGreen[TOTAL_COLS];
 
-// Drives one full frame, mirroring the structure proven correct by REPLAY_MODE.
-//
-// STRUCTURE CONFIRMED FROM THE CAPTURE (not assumed):
-//   - 16 loads per frame, addresses counting DOWN 7,7,6,6,...,1,1,0,0
-//   - each address gets TWO loads = two independent bit-planes
-//   - the SECOND load at address 0 is 160 bits, not 80 (one full-chain flush)
-//   - total 15*80 + 160 = 1360 bits
-//   - one OE low window per load, ~8us, immediately after each latch
-//
-// The two planes are genuinely different data: in the capture, consecutive loads
-// at the same address had IDENTICAL red content but DIFFERENT green content. That
-// is the original's 2-level brightness scheme, not duplicated frames. The previous
-// implementation shifted the same buffer twice, which threw that away.
-//
-// FIXED HERE (was Known-bugs #1 and #2): the row address and the OE window are now
-// set PER PLANE, inside the plane loop. Previously both planes were shifted and
-// latched before the address and OE were touched even once, so plane 0's latch was
-// overwritten by plane 1's while still blanked - plane 0 never reached the LEDs,
-// and the frame emitted 8 OE windows instead of the captured 16.
-//
-// CAVEAT, measured: on this panel OE does NOT appear to gate illumination. Changing
-// the window from 8us to 1us produced no current change (2.666A -> 2.723A), while
-// 245 pin 14 reads 4.74V against a 4.93V rail, i.e. it IS pulsing correctly. The OE
-// sequencing below is kept because it matches the original hardware exactly, not
-// because it has been shown to do anything here.
+// (The "two bit-planes per address" and "OE does not gate illumination" notes that
+// used to sit here were both disproved - the loads are pipelined and OE is
+// ACTIVE-HIGH. See the refreshFrame() block below and debug_log.md.)
 // ---- POLARITY_SWEEP — test all four R/G polarity combinations automatically ----
 // The "off" values for this panel have been inferred repeatedly and repeatedly
 // been wrong. Rather than propose another model, cycle through all four
@@ -894,7 +853,7 @@ static const uint8_t font5x7[10][7] = {
 #define FG_GREEN    GREEN_OFF
 
 // Per-pixel brightness levels, 0..BCM_LEVELS-1. Digits full, background dim.
-#define BG_LEVEL    1              // green background at 1/4 brightness
+#define BG_LEVEL    1              // green background at 1/3 brightness
 #define FG_LEVEL    (BCM_LEVELS-1) // digits at full brightness
 
 // ---- ANIM_MODE — frame-by-frame animation player ----
@@ -907,9 +866,10 @@ static const uint8_t font5x7[10][7] = {
 // the player applies the geometry inversions (row flip, column flip, module
 // order) so the frame data can be authored the way it looks.
 #define ANIM_MODE 1
-// MUST match the fps the frames were rasterised at, or motion stutters: the
-// animator's default is 20 fps, so 50ms. A mismatch drops or repeats frames.
-#define ANIM_FRAME_MS 33        // 30 fps video; use 20 for the 50 fps showcase/plasma2
+// MUST equal 1000 / the fps the frames were rasterised at, or frames are dropped
+// or repeated: 50 for 20 fps (demo, plasma), 33 for 30 fps video, 20 for 50 fps
+// (showcase, plasma2).
+#define ANIM_FRAME_MS 33
 
 #if ANIM_MODE
 #include "frames.h"
@@ -1168,7 +1128,7 @@ static void loadSparsePattern(void) {
 static void blankChain(void);
 
 // ============================================================================
-//  refreshFrame() - PIPELINED. Restructured <date of this change>.
+//  refreshFrame() - PIPELINED.
 // ============================================================================
 // ROLLBACK: the previous non-pipelined version is preserved verbatim at the
 // bottom of this comment block. If this change makes things worse, delete the
@@ -1194,7 +1154,7 @@ static void blankChain(void);
 //
 // So the two loads per address are NOT bit-planes. The original controller is
 // PIPELINED: while row N is being displayed, it shifts in row N+1's data. The
-// old README theory of "2-level BCM brightness weighting" is wrong, and so was
+// old theory of "2-level BCM brightness weighting" (debug_log.md) is wrong, and so was
 // the previous implementation, which shifted the SAME row twice per address.
 //
 // That is why our driver produced flat colour while the replay produced text:
@@ -1298,22 +1258,12 @@ static void refreshFrame() {
 #else
     delayMicroseconds(ACTIVE_ROW_ON_US);
 #endif
-    // REVERTED. Shifting here (after setOE(false), i.e. "blanked") measured
-    // 4.5A with the row drivers warming. Shifting BEFORE the OE window - see
-    // above - measured 0.143A and stayed cool. The blanked-shift version is
-    // theoretically what the capture shows the original doing, but on this
-    // hardware it draws 30x more current, so the theory is wrong somewhere and
-    // the measurement wins.
-    //
-    // Known unresolved: at 0.143A the panel still shows uniform amber whose
-    // current does not vary with buffer contents, so buffer data is not reaching
-    // the display. That is a real bug - but it is a COOL bug, and diagnosing it
-    // must not be done by running the panel at 4.5A.
     setOE(false);          // blank first: PIN_OE LOW = blanked (active-high panel)
 
-    // Shift the next row's data while BLANKED. Shifting is ~400us against an 8us
-    // lit window, so this is where the panel spends nearly all its time - and it
-    // must be spent blanked.
+    // Shift the next row's data while BLANKED. Bit-banged, shifting was ~400us
+    // against an 8us lit window, so this is where the panel spent nearly all its
+    // time - and it must be spent blanked. (PIO shifts far faster, but the rule
+    // still holds: lighting a row during the shift shows the chain contents live.)
     //
     // MEASURED, to stop this being re-broken a third time:
     //   shift while PIN_OE HIGH -> 4.5A, drivers warming   (WRONG)
@@ -1330,8 +1280,8 @@ struct PinMapEntry { uint8_t gpio; const char *name; const char *idc; };
 static const PinMapEntry pinMap[] = {
   { PIN_SRCLK, "SRCLK",  "IDC 1"  },
   { PIN_RCLK,  "RCLK",   "IDC 3"  },
-  { PIN_R,     "R data", "IDC 6"  },
-  { PIN_G,     "G data", "IDC 7"  },
+  { PIN_G,     "G data", "IDC 5"  },
+  { PIN_R,     "R data", "IDC 7"  },
   { PIN_ADDR0, "A0",     "IDC 11" },
   { PIN_ADDR1, "A1",     "IDC 13" },
   { PIN_ADDR2, "A2",     "IDC 15" },
@@ -1796,7 +1746,7 @@ void setup() {
 // pausing on each one and printing its index + derived module/column-within-module.
 // Purpose: empirically map bit index -> physical LED position, rather than guessing
 // from theory. Note down what you actually see for each printed line — that mapping
-// is what resolves the module/column ordering (README open question #3).
+// is what resolved the module/column ordering (see README "Geometry").
 #define WALK_STEP_MS 600
 
 void loop() {

@@ -846,6 +846,43 @@ let showcase : anim =
 (* Entry point                                                               *)
 (* ------------------------------------------------------------------------ *)
 
+(* ------------------------------------------------------------------------ *)
+(* Brightness test card                                                      *)
+(* ------------------------------------------------------------------------ *)
+
+(* Every colour at every level, for checking the firmware's per-pixel PWM.
+   Rendered at 30 fps so it plays with the default ANIM_FRAME_MS 33.
+
+   Part 1, 8 s - the chart. One whole module (5 cols) per swatch:
+       modules  0- 3  red    levels 0 1 2 3
+       modules  4- 7  green  levels 0 1 2 3
+       modules  8-11  amber  levels 0 1 2 3
+       modules 12-15  a level-3 amber column sweeping left to right
+   Level 0 swatches must be DARK. Each step 1 -> 2 -> 3 should look brighter,
+   and level 3 should match the old "full brightness". The sweep confirms the
+   animation is running and that left/right is not mirrored.
+
+   Part 2, 24 s - whole panel uniform, 2 s per step, red then green then amber,
+   levels 0 1 2 3 each. Long enough to read panel current on a DMM: it should
+   step up roughly 0 : 1/3 : 2/3 : 1 within each colour. *)
+let level_chart : anim =
+  fun t x _ ->
+    let m = x / 5 in
+    if m < 12 then
+      let c = match m / 4 with 0 -> Red | 1 -> Green | _ -> Amber in
+      px c (m mod 4)
+    else
+      let pos = 60 + (int_of_float (t *. 10.) mod 20) in
+      if x = pos then px Amber 3 else off
+
+let level_steps : anim =
+  fun t _ _ ->
+    let i = min 11 (int_of_float (t /. 2.)) in
+    let c = match i / 4 with 0 -> Red | 1 -> Green | _ -> Amber in
+    px c (i mod 4)
+
+let level_test : anim = seq 8. level_chart level_steps
+
 let usage () =
   print_endline "usage:\n\
   \  animator demo     frames.h\n\
@@ -861,7 +898,8 @@ let usage () =
   \  animator plasma  frames.h [seconds]       (20 fps)\n\
   \  animator plasma2 frames.h [seconds]       (50 fps - set ANIM_FRAME_MS 20)\n\
   \  animator plasmatext frames.h [TEXT]       text knocked out of solid plasma\n\
-  \  animator marquee frames.h \"TEXT\""
+  \  animator marquee frames.h \"TEXT\"\n\
+  \  animator levels  frames.h       brightness test card (30 fps - ANIM_FRAME_MS 33)"
 
 let () =
   Random.self_init ();
@@ -910,4 +948,7 @@ let () =
       let a = marquee Amber 3 20. s in
       emit_header (rasterise a ~fps:20.
                      ~seconds:(float (text_width s + width) /. 20.)) out
+  | ["levels"; out] ->
+      (* 30 fps: matches the default ANIM_FRAME_MS 33. *)
+      emit_header (rasterise level_test ~fps:30. ~seconds:32.) out
   | _ -> usage ()

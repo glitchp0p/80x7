@@ -1,4 +1,36 @@
+# TODO
+
+## 1. PRIORITY: measure panel current under the PIO driver
+
+All the current figures in `README.md` were measured with the old bit-banged
+driver. With PIO, each row is lit for a much larger share of its slot, and
+nothing has been measured since. So far it has only been checked by touch:
+warm, not hot.
+
+1. Put the DMM in series with the panel's 5V feed at JP1 (10A jack, DC amps).
+2. Generate and flash the test card:
+   `./animator levels ../src/frames.h`, then `pio run`, then flash.
+3. In the second part (8–32 s), note the current at each 2 s step: red, green
+   and amber at levels 0, 1, 2 and 3. The estimate for full-panel amber at
+   level 3 is ~3 A.
+4. Repeat at `ROW_ON_TIME_US 32` for comparison.
+5. Optionally run 10+ minutes on full amber to confirm the current stays flat,
+   as in the replay soak.
+6. Update the "Power and safety" table and "Brightness" in `README.md`.
+   If it comes in near the supply's rating, lower `ROW_ON_TIME_US`.
+
+---
+
 # Hospital panel — bring-up procedure
+
+> **Status: completed.** The panel is fully working. This is the original
+> bring-up plan, kept for reference. Some of its assumptions turned out wrong:
+> OE is active-HIGH, both data lines are active-LOW, the two loads per address
+> are pipelining rather than bit-planes, and address 0 is a real row. Test
+> selection is now the single `MODE` switch in `main.cpp`, not separate flags.
+> `README.md` describes the current behaviour, and `debug_log.md` has the full
+> history. "Open question #N" below refers to the list at the end of
+> `debug_log.md`.
 
 Work top to bottom. Each stage has a pass condition; **do not move on until it
 passes.** The project has already lost weeks to two independent faults that both
@@ -196,8 +228,10 @@ This one test resolves, at once:
 - **Module ordering** — does bit 0 land on the leftmost module?
 - **Colour mapping** — does "RED" light red?
 
-Write down the actual mapping. That's the deliverable of this stage; update the
-README's open questions from it.
+Write down the actual mapping. That's the deliverable of this stage.
+
+> **Done:** see "Geometry" in `README.md`. Rows, columns and module order are
+> all inverted.
 
 ---
 
@@ -212,11 +246,19 @@ Note the known bug here: **address 0 currently displays row 0's real data**
 because `rowIndex` maps both addr 0 and addr 1 to `redBuf[0]`. Fix that before
 trusting row results.
 
+> **Done:** address 0 is a real row. Addresses 0–6 map to rows 0–6
+> (`BLANK_ADDR -1`), and the "stuck row" was the pipeline seam, fixed by
+> `PIPELINE_PRIME`.
+
 ---
 
 ## Stage 7 — Bit-planes and brightness
 
-**Fix the bit-plane bug first** (README, Known firmware bugs #1): both planes are
+> **Superseded:** the two loads per address turned out to be pipelining, not
+> bit-planes (see "Driver structure" in `README.md`). Per-pixel brightness is
+> now the firmware's own `levelBuf` scheme.
+
+**Fix the bit-plane bug first** (`debug_log.md`, Known firmware bugs #1): both planes are
 currently shifted and latched before the row address and OE window are set, so
 plane 0 is overwritten and never displayed. Restructure `refreshFrame()` so each
 plane gets its own address + OE window. This also fixes the OE-count mismatch
@@ -229,7 +271,10 @@ genuine BCM brightness weighting or something else (open question #5).
 
 ## Stage 8 — Duty cycle and thermal
 
-Re-measure OE duty at the GPIO. **The 18.8% / 6.4% / 4.1% figures in the README
+> **Still relevant, but now for the PIO driver:** re-measure panel current at
+> `ROW_ON_TIME_US` 8 and 64 (see "Brightness" in `README.md`).
+
+Re-measure OE duty at the GPIO. **The 18.8% / 6.4% / 4.1% figures in `debug_log.md`
 are stale** — they come from an earlier code state, and the current bit-banged
 loop has a much longer frame period, so 8µs is now a far smaller fraction of it.
 Expect dim rather than hot.
