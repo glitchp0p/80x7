@@ -15,6 +15,32 @@ This file holds only what is currently true. The full bring-up history,
 including every disproved theory and the evidence behind each finding, is in
 [`debug_log.md`](debug_log.md).
 
+## Build and flash
+
+Needs [PlatformIO](https://platformio.org/). The first build downloads the
+RP2040 platform, which takes a few minutes.
+
+1. **Pick the content.** The firmware plays whatever animation is in
+   `src/frames.h`. To change it, regenerate it with `tools/animator` or export
+   it from lpx; see "Animation pipeline" and "Content from lpx" below.
+2. **Build** from the project root:
+   ```
+   pio run
+   ```
+   This writes `.pio/build/rp2040zero/firmware.uf2`.
+3. **Put the Zero into boot mode:** hold its **BOOT** button while plugging in
+   USB, then release it. A USB drive called **RPI-RP2** appears.
+4. **Copy the firmware onto that drive:**
+   ```
+   cp .pio/build/rp2040zero/firmware.uf2 /media/rich/RPI-RP2/
+   ```
+   The drive disappears and the Zero reboots into the new firmware. The onboard
+   LED goes solid blue, then blinks green once a second.
+
+Power the panel before plugging in the Zero (see "Power and safety").
+
+Serial monitor, optional: `pio device monitor -b 115200`.
+
 ## Panel hardware
 
 - **16 identical 5×7 bi-colour modules** in one line on a single long PCB.
@@ -110,14 +136,7 @@ its pads are labelled with GP numbers directly.
   debug probe (GP2 = SWCLK, GP3 = SWDIO, GP4/5 = UART). The two are physically
   indistinguishable.
 
-Flash: hold BOOTSEL, plug in, then
-
-```
-pio run
-cp .pio/build/rp2040zero/firmware.uf2 /media/rich/RPI-RP2/
-```
-
-Serial monitor: `pio device monitor -b 115200`.
+To build and flash, see "Build and flash" at the top.
 
 ## Firmware (`src/main.cpp`)
 
@@ -174,9 +193,11 @@ way they look.
   roughly linear, and thermally safe. Refresh rate does not affect brightness,
   because each row gets exactly one slot per frame.
 - **Per pixel:** `levelBuf` holds a level of 0–3 for each pixel (`BCM_LEVELS 4`).
-  This is plain duty-cycle PWM over 3 refreshes. The phase cycles 0, 1, 2, and
-  a pixel is lit on phase P if its level is greater than P. That gives **0 = off,
-  1 = ⅓, 2 = ⅔, 3 = full** (of the global brightness).
+  This is plain duty-cycle PWM over `BCM_PHASES` (8) refreshes, **gamma-corrected**:
+  `levelDuty[] = {0, 1, 3, 8}` gives **0 = off, 1 = ⅛, 2 = ⅜, 3 = full** on-time,
+  which *looks* roughly evenly spaced. Linear ⅓ / ⅔ / full looked like ~60% /
+  ~85% / 100%, so in a busy drawing every level read as "bright". Tune the middle
+  two entries of `levelDuty` to taste.
 - **Per colour:** `RED_DUTY` / `GREEN_DUTY` out of `DUTY_STEPS` sub-frames.
 
 #### How to set brightness
@@ -194,8 +215,9 @@ A pixel's level only matters if one of its colours is on. Level 0 is always
 off.
 
 Both the per-pixel and per-colour schemes stretch the refresh: a full
-brightness cycle takes 3 refreshes. With the bit-banged driver, ~186 fps fell
-to ~46–62 fps, near flicker; the PIO driver removes most of that cost.
+brightness cycle takes `BCM_PHASES` (8) refreshes. The PIO driver runs ~1190
+refreshes/s (serial `frames/s`), so the cycle repeats at ~150 Hz, flicker-free.
+The bit-banged fallback (~186/s) would flicker at 8 phases.
 
 #### Test card: `animator levels`
 

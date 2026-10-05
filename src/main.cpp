@@ -334,18 +334,21 @@ static inline bool greenSuppressed(void) { return false; }
 static inline void advanceGreenSubFrame(void) { }
 #endif
 
-// ---- PER-PIXEL BRIGHTNESS ----
+// ---- PER-PIXEL BRIGHTNESS (gamma-corrected) ----
 // levelBuf holds a brightness level 0..BCM_LEVELS-1 for every pixel. Despite the
 // name this is plain duty-cycle PWM, not binary-coded modulation: each refresh is
-// one phase, the phase cycles 0..BCM_LEVELS-2, and a pixel is lit on phase P only
-// if its level is greater than P. With BCM_LEVELS 4 there are 3 phases, so
-// levels 0/1/2/3 are lit on 0/1/2/3 of every 3 refreshes = off, 1/3, 2/3, full.
+// one phase, the phase cycles 0..BCM_PHASES-1, and a pixel is lit on phase P only
+// if levelDuty[level] > P. So level L is lit on levelDuty[L] of every BCM_PHASES
+// refreshes.
 //
-// (It used to cycle BCM_LEVELS phases, which left the top level at 3/4 and made
-// full brightness unreachable.)
+// GAMMA: the eye sees LED brightness on a compressed curve, so LINEAR steps
+// (1/3, 2/3, full - the previous scheme) looked like ~60%, ~85% and 100%: in a
+// busy drawing every level read as "bright". Duty 1/8, 3/8, 8/8 looks roughly
+// evenly spaced (~40%, ~65%, 100% perceived).
 //
-// COST: a full brightness cycle takes BCM_LEVELS-1 refreshes. Cheap with the PIO
-// driver; with the bit-banged fallback keep BCM_LEVELS small to stay above flicker.
+// COST: a full cycle takes BCM_PHASES refreshes. The PIO driver measured ~1190
+// refreshes/s, so 8 phases repeat at ~150Hz - flicker-free. With the bit-banged
+// fallback (~186/s) that would flicker; use 3 phases with {0,1,2,3} there.
 // Blanking guard around the latch and address change. The row drivers and the
 // '138 take a finite time to settle; if OE is re-asserted too soon after the
 // address changes, a row briefly shows the PREVIOUS row's latched data. That
@@ -356,11 +359,15 @@ static inline void advanceGreenSubFrame(void) { }
 #define GHOST_GUARD_US 3
 
 #define BCM_LEVELS 4
+#define BCM_PHASES 8
+// Refreshes lit per BCM_PHASES, by level. Tune the middle two to taste; the last
+// must equal BCM_PHASES (full brightness) and the first 0 (off).
+static const uint8_t levelDuty[BCM_LEVELS] = { 0, 1, 3, 8 };
 static uint8_t levelBuf[NUM_ROWS][TOTAL_COLS];
 static uint8_t bcmPhase = 0;
 
 static inline void advanceBcmPhase(void) {
-  bcmPhase = (uint8_t)((bcmPhase + 1) % (BCM_LEVELS - 1));
+  bcmPhase = (uint8_t)((bcmPhase + 1) % BCM_PHASES);
 }
 
 // ============================================================================
@@ -452,7 +459,7 @@ static void shiftOutRowL(const uint8_t *redRow, const uint8_t *greenRow,
     uint32_t word = 0;
     for (int i = 0; i < 16; i++) {
       int col = w * 16 + i;
-      bool lit = (levelRow == NULL) || (levelRow[col] > bcmPhase);
+      bool lit = (levelRow == NULL) || (levelDuty[levelRow[col]] > bcmPhase);
       uint32_t r = (redSuppressed()   || !lit) ? RED_OFF   : redRow[col];
       uint32_t g = (greenSuppressed() || !lit) ? GREEN_OFF : greenRow[col];
       word |= ((g & 1u) | ((r & 1u) << 1)) << (2 * i);
@@ -467,7 +474,7 @@ static void shiftOutRowL(const uint8_t *redRow, const uint8_t *greenRow,
 static void shiftOutRowL(const uint8_t *redRow, const uint8_t *greenRow,
                          const uint8_t *levelRow) {
   for (int col = 0; col < TOTAL_COLS; col++) {
-    bool lit = (levelRow == NULL) || (levelRow[col] > bcmPhase);
+    bool lit = (levelRow == NULL) || (levelDuty[levelRow[col]] > bcmPhase);
     digitalWrite(PIN_R, (redSuppressed()   || !lit) ? RED_OFF   : redRow[col]);
     digitalWrite(PIN_G, (greenSuppressed() || !lit) ? GREEN_OFF : greenRow[col]);
     delayMicroseconds(1);
@@ -853,7 +860,7 @@ static const uint8_t font5x7[10][7] = {
 #define FG_GREEN    GREEN_OFF
 
 // Per-pixel brightness levels, 0..BCM_LEVELS-1. Digits full, background dim.
-#define BG_LEVEL    1              // green background at 1/3 brightness
+#define BG_LEVEL    1              // green background, dimmest level
 #define FG_LEVEL    (BCM_LEVELS-1) // digits at full brightness
 
 // ---- ANIM_MODE — frame-by-frame animation player ----
