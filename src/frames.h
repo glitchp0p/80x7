@@ -7,6 +7,8 @@
 // Rows TOP-FIRST, columns LEFT-FIRST as a viewer sees the panel.
 // The firmware applies the geometry inversions.
 
+// Rendered at 30 fps.
+#define ANIM_FRAME_MS 33
 #define ANIM_FRAME_COUNT 960
 
 static const uint8_t animFrames[ANIM_FRAME_COUNT][560] = {

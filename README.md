@@ -199,8 +199,7 @@ to ~46–62 fps, near flicker; the PIO driver removes most of that cost.
 
 #### Test card: `animator levels`
 
-`./animator levels ../src/frames.h` generates a 32 s loop at 30 fps, which
-plays with the default `ANIM_FRAME_MS 33`.
+`./animator levels ../src/frames.h` generates a 32 s loop at 30 fps.
 
 - **0–8 s, a chart:** modules 0–3 are red, 4–7 green and 8–11 amber, each set
   at levels 0, 1, 2 and 3. Level 0 must be dark, and each step up should be
@@ -288,9 +287,31 @@ are top-first and columns left-first, *as a viewer sees the panel*. Bits 3:2
 hold the colour (0 off, 1 red, 2 green, 3 amber) and bits 1:0 the brightness
 level, 0–3.
 
-**Playback:** set `ANIM_MODE 1` in `main.cpp`. **`ANIM_FRAME_MS` must equal
-1000 / the fps the frames were made at** (50 for 20 fps, 33 for 30 fps, 20 for
-50 fps), or frames will be dropped or repeated.
+**Playback:** set `ANIM_MODE 1` in `main.cpp`. The frame period,
+`ANIM_FRAME_MS` (1000 / fps), normally comes from `frames.h` itself, so nothing
+in `main.cpp` needs to change.
+- **Written automatically:** by every animator effect (`demo`, `plasma`,
+  `levels` and so on) and by every lpx export.
+- **Not written:** by `pan`, `ani`, `video` and `slitscan`, because those
+  inputs don't record a frame rate. The firmware then falls back to its
+  default of 33 (30 fps). If your source ran at a different rate, add
+  `#define ANIM_FRAME_MS` to the header or change that default.
+
+## Content from lpx (`~/LPX`)
+
+lpx (a separate repo; see its `lpx_manual.md`) is a pixel/ASCII animator and video
+converter with a `hospital` profile (80×7, off plus red/green/amber at levels
+1–3). Its `-e hospital` export is a drop-in `frames.h`, including
+`ANIM_FRAME_MS`:
+
+```
+lpx -p hospital panel.lpx                                               # draw
+lpx -e hospital -o ~/pi_pico/andy2/src/frames.h panel.lpx               # export
+lpx -p hospital -i clip.mp4 -e hospital -o ~/pi_pico/andy2/src/frames.h # video straight to the panel
+cd ~/pi_pico/andy2 && pio run                                           # then flash the .uf2
+```
+
+Hospital `.lpx` files are also valid `animator.ml` `.ani` files.
 
 ## Original controller's protocol (from logic-analyzer captures)
 

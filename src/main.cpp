@@ -866,13 +866,18 @@ static const uint8_t font5x7[10][7] = {
 // the player applies the geometry inversions (row flip, column flip, module
 // order) so the frame data can be authored the way it looks.
 #define ANIM_MODE 1
-// MUST equal 1000 / the fps the frames were rasterised at, or frames are dropped
-// or repeated: 50 for 20 fps (demo, plasma), 33 for 30 fps video, 20 for 50 fps
-// (showcase, plasma2).
-#define ANIM_FRAME_MS 33
 
 #if ANIM_MODE
 #include "frames.h"
+
+// Frame period. frames.h sets this itself when its generator knew the frame rate
+// (animator.ml's generated effects, every lpx export), so normally nothing needs
+// changing here. This default only applies to headers without one (.pan, .ani,
+// video and slitscan from animator.ml, or old headers). It must equal 1000 / the
+// fps the frames were made at, or frames are dropped or repeated.
+#ifndef ANIM_FRAME_MS
+#define ANIM_FRAME_MS 33
+#endif
 
 #define PIX_COLOUR(b) (uint8_t)(((b) >> 2) & 3)
 #define PIX_LEVEL(b)  (uint8_t)( (b)       & 3)
